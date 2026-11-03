@@ -5,7 +5,7 @@ The GitHub Pages site is a static UI preview. Raw UDP is not available to web pa
 ## Requirements
 
 - Python 3.10 or later
-- `pygame` for MP3 playback in the client
+- `pygame` for MP3 playback and `mutagen` for track duration and seeking in the client
 
 Install the client dependency:
 
@@ -42,7 +42,7 @@ python server.py --udp --host 0.0.0.0 --port 5005 --library .\music
 
 If Windows Firewall prompts you, allow Python on **Private networks only**. In the client, enter the server computer's local IPv4 address (find it with `ipconfig`) and port `5005`.
 
-The prototype transfers MP3 files as numbered UDP chunks, retries missing chunks, checks the completed file with SHA-256, then plays it. Playback begins after the whole file has arrived; this is file delivery over UDP, not live audio streaming. The UDP prototype has no authentication or encryption: use it only on a trusted local network, not the public internet.
+The prototype transfers MP3 files as numbered UDP chunks, retries missing chunks, checks the completed file with SHA-256, then plays it. The client includes a seek slider with elapsed and total time. Playback begins after the whole file has arrived; this is file delivery over UDP, not live audio streaming. The UDP prototype has no authentication or encryption: use it only on a trusted local network, not the public internet.
 
 ## UI preview
 

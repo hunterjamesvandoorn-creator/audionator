@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import math
 import queue
 import tkinter as tk
+import time
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any
 
 import pygame
+from mutagen import MutagenError
+from mutagen.mp3 import MP3
 
 from receiver import AudioReceiver
 
@@ -32,7 +36,11 @@ class AudionatorClient:
         self.track_by_name: dict[str, dict[str, Any]] = {}
         self.current_path: Path | None = None
         self.is_paused = False
-        self._progress_after: str | None = None
+        self.playback_finished = False
+        self.playback_offset = 0.0
+        self.playback_started_at: float | None = None
+        self.track_duration = 0.0
+        self.is_seeking = False
         self._configure_theme()
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -321,13 +329,61 @@ class AudionatorClient:
             anchor="w",
         )
         self.now_playing.pack(fill="x")
-        self.progress = ttk.Progressbar(
+        self.transfer_progress = ttk.Progressbar(
             player,
             style="Audionator.Horizontal.TProgressbar",
             maximum=100,
             value=0,
         )
-        self.progress.pack(fill="x", pady=(9, 8))
+        self.transfer_progress.pack(fill="x", pady=(9, 8))
+        self.transfer_progress.pack_forget()
+
+        self.seek_row = tk.Frame(player, bg=PANEL_LIGHT)
+        self.seek_row.pack(fill="x", pady=(6, 8))
+        self.elapsed_label = tk.Label(
+            self.seek_row,
+            text="0:00",
+            bg=PANEL_LIGHT,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+            width=5,
+            anchor="w",
+        )
+        self.elapsed_label.pack(side="left")
+        self.seek_var = tk.DoubleVar(value=0.0)
+        self.seek_slider = tk.Scale(
+            self.seek_row,
+            from_=0.0,
+            to=1.0,
+            orient="horizontal",
+            variable=self.seek_var,
+            command=self._on_seek_changed,
+            showvalue=False,
+            resolution=0.1,
+            bg=PANEL_LIGHT,
+            fg=MUTED,
+            troughcolor="#3a3d34",
+            activebackground=ACCENT,
+            highlightthickness=0,
+            bd=0,
+            sliderrelief="flat",
+            sliderlength=14,
+            state="disabled",
+        )
+        self.seek_slider.pack(side="left", fill="x", expand=True, padx=8)
+        self.seek_slider.bind("<ButtonPress-1>", self._begin_seek)
+        self.seek_slider.bind("<ButtonRelease-1>", self._end_seek)
+        self.duration_label = tk.Label(
+            self.seek_row,
+            text="0:00",
+            bg=PANEL_LIGHT,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+            width=5,
+            anchor="e",
+        )
+        self.duration_label.pack(side="right")
+
         controls = tk.Frame(player, bg=PANEL_LIGHT)
         controls.pack(fill="x")
         self.play_button = tk.Button(
@@ -348,7 +404,7 @@ class AudionatorClient:
         self.play_button.pack(side="left")
         self.time_label = tk.Label(
             controls,
-            text="MP3 playback is available after a track is received.",
+            text="Drag the timeline to seek through a received track.",
             bg=PANEL_LIGHT,
             fg=MUTED,
             font=("Segoe UI", 8),
@@ -384,7 +440,8 @@ class AudionatorClient:
             return
         self.active_transfer_id = transfer_id.hex()
         self.receive_button.configure(state="disabled", text="Receiving…")
-        self.progress.configure(value=0)
+        self.transfer_progress.configure(value=0)
+        self.transfer_progress.pack(fill="x", pady=(9, 8), before=self.seek_row)
         self.now_playing.configure(text=f"Preparing  ·  {name}")
         self._show_status(f"Receiving {name} over UDP…")
 
@@ -415,21 +472,34 @@ class AudionatorClient:
             self._show_status("Library updated. Select a track to receive it.")
         elif event == "transfer_started":
             self.active_transfer_id = payload["id"]
+            self.transfer_progress.configure(value=0)
+            self.transfer_progress.pack(fill="x", pady=(9, 8), before=self.seek_row)
             self.now_playing.configure(text=f"Receiving  ·  {payload['name']}")
             self._show_status(f"Receiving {payload['name']} over UDP…")
         elif event == "transfer_progress":
             if payload["id"] == getattr(self, "active_transfer_id", None):
                 percent = 100 if payload["total"] == 0 else 100 * payload["received"] / payload["total"]
-                self.progress.configure(value=percent)
+                self.transfer_progress.configure(value=percent)
                 self._show_status(f"Receiving {payload['name']}… {percent:.0f}%")
         elif event == "transfer_complete":
+            self.transfer_progress.pack_forget()
             self.receive_button.configure(state="normal", text="↓   Receive & play")
             self._play_file(Path(payload["path"]))
         elif event == "error":
+            self.transfer_progress.pack_forget()
             self.receive_button.configure(state="normal", text="↓   Receive & play")
             self._show_status(payload["message"], is_error=True)
 
     def _play_file(self, path: Path) -> None:
+        duration_error: str | None = None
+        try:
+            duration = float(MP3(path).info.length)
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("The MP3 file does not contain a usable duration.")
+        except (OSError, MutagenError, TypeError, ValueError) as error:
+            duration = 0.0
+            duration_error = str(error)
+
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
@@ -441,35 +511,120 @@ class AudionatorClient:
             self._show_status(f"Received the MP3, but playback failed: {error}", is_error=True)
             return
         self.current_path = path
+        self.track_duration = duration
+        self.playback_offset = 0.0
+        self.playback_started_at = time.monotonic()
+        self.playback_finished = False
         self.is_paused = False
         self.play_button.configure(state="normal", text="Ⅱ  Pause")
         self.now_playing.configure(text=f"Now playing  ·  {path.name}")
-        self.time_label.configure(text="Playing from your received library")
-        self._show_status(f"Received and playing {path.name}.")
+        self.seek_var.set(0.0)
+        self.seek_slider.configure(from_=0.0, to=max(duration, 1.0))
+        self.seek_slider.configure(state="normal" if duration else "disabled")
+        self._update_time_labels(0.0)
+        if duration_error:
+            self._show_status(f"Playing {path.name}, but seeking is unavailable: {duration_error}", is_error=True)
+        else:
+            self._show_status(f"Received and playing {path.name}.")
 
     def _toggle_playback(self) -> None:
         if not self.current_path:
             return
         try:
-            if self.is_paused:
+            if self.playback_finished:
+                pygame.mixer.music.play()
+                self.playback_offset = 0.0
+                self.playback_started_at = time.monotonic()
+                self.playback_finished = False
+                self.is_paused = False
+                self.play_button.configure(text="Ⅱ  Pause")
+                self.seek_var.set(0.0)
+                self._update_time_labels(0.0)
+            elif self.is_paused:
                 pygame.mixer.music.unpause()
+                self.playback_started_at = time.monotonic()
+                self.is_paused = False
                 self.play_button.configure(text="Ⅱ  Pause")
             else:
+                self.playback_offset = self._current_position()
                 pygame.mixer.music.pause()
+                self.playback_started_at = None
+                self.is_paused = True
                 self.play_button.configure(text="▶  Play")
-            self.is_paused = not self.is_paused
+                self._update_time_labels(self.playback_offset)
         except pygame.error as error:
             self._show_status(f"Playback control failed: {error}", is_error=True)
 
+    def _begin_seek(self, _event: tk.Event) -> None:
+        if self.current_path and self.track_duration > 0:
+            self.is_seeking = True
+
+    def _end_seek(self, _event: tk.Event) -> None:
+        if self.is_seeking:
+            self.root.after_idle(self._commit_seek)
+
+    def _on_seek_changed(self, value: str) -> None:
+        if self.is_seeking:
+            self._update_time_labels(float(value))
+
+    def _commit_seek(self) -> None:
+        if not self.is_seeking or not self.current_path:
+            return
+        self.is_seeking = False
+        position = min(max(self.seek_var.get(), 0.0), self.track_duration)
+        try:
+            if self.playback_finished:
+                pygame.mixer.music.play(start=position)
+                self.is_paused = False
+                self.playback_finished = False
+                self.playback_started_at = time.monotonic()
+                self.play_button.configure(text="Ⅱ  Pause")
+            else:
+                pygame.mixer.music.set_pos(position)
+                if not self.is_paused:
+                    self.playback_started_at = time.monotonic()
+            self.playback_offset = position
+            self._update_time_labels(position)
+        except pygame.error as error:
+            self._show_status(f"Could not seek to that position: {error}", is_error=True)
+
+    def _current_position(self) -> float:
+        if self.is_paused or self.playback_started_at is None:
+            return self.playback_offset
+        position = self.playback_offset + time.monotonic() - self.playback_started_at
+        return min(position, self.track_duration)
+
+    def _update_time_labels(self, position: float) -> None:
+        self.elapsed_label.configure(text=self._format_time(position))
+        self.duration_label.configure(text=self._format_time(self.track_duration))
+
     def _poll_playback(self) -> None:
-        if self.current_path and not self.is_paused:
+        if self.current_path and not self.is_paused and not self.playback_finished:
             try:
                 if not pygame.mixer.music.get_busy():
-                    self.play_button.configure(text="▶  Play")
+                    self.playback_offset = self.track_duration
+                    self.playback_started_at = None
+                    self.playback_finished = True
                     self.is_paused = True
+                    self.play_button.configure(text="▶  Play")
+                    self._update_time_labels(self.track_duration)
+                    self.seek_var.set(self.track_duration)
+                elif not self.is_seeking:
+                    position = self._current_position()
+                    self.seek_var.set(position)
+                    self._update_time_labels(position)
             except pygame.error as error:
                 self._show_status(f"Audio output error: {error}", is_error=True)
         self.root.after(500, self._poll_playback)
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        minutes, seconds_part = divmod(total_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds_part:02d}"
+        return f"{minutes}:{seconds_part:02d}"
 
     def _show_status(self, message: str, is_error: bool = False) -> None:
         self.status_var.set(message)
