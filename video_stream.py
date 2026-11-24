@@ -3,54 +3,12 @@ from __future__ import annotations
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
+from client_ui import CLIENT_HTML
 from receiver import AudioReceiver
 
-
-PLAYER_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Audionator video player</title>
-  <style>
-    :root { color-scheme: dark; font-family: "Segoe UI", Arial, sans-serif; background: #10110f; color: #f2f2e9; }
-    * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 28px; }
-    main { width: min(1120px, 100%); }
-    .brand { margin-bottom: 16px; color: #d3f36b; font-size: 13px; font-weight: 700; letter-spacing: 1.2px; }
-    h1 { margin: 0 0 7px; font-size: clamp(20px, 3vw, 29px); }
-    #message { min-height: 24px; margin: 0 0 17px; color: #a7aa9f; font-size: 13px; }
-    .screen { overflow: hidden; border: 1px solid #30332d; border-radius: 15px; background: #080908; box-shadow: 0 22px 65px #0008; }
-    video { display: block; width: 100%; max-height: 72vh; aspect-ratio: 16 / 9; background: #050605; }
-    .foot { margin-top: 15px; color: #777b71; font-size: 11px; }
-  </style>
-</head>
-<body>
-  <main>
-    <div class="brand">AUDIONATOR · UDP VIDEO</div>
-    <h1 id="title">Video</h1>
-    <p id="message" role="status">Buffering video over reliable UDP…</p>
-    <div class="screen"><video id="video" controls autoplay playsinline></video></div>
-    <div class="foot">Playback starts after a short buffer. The player pauses if it needs more data.</div>
-  </main>
-  <script>
-    const params = new URLSearchParams(location.search);
-    const video = document.getElementById("video");
-    const message = document.getElementById("message");
-    document.getElementById("title").textContent = params.get("name") || "Video";
-    video.src = "/video.mp4";
-    video.addEventListener("playing", () => { message.textContent = "Playing · receiving video over UDP"; });
-    video.addEventListener("waiting", () => { message.textContent = "Buffering… playback will resume when data arrives."; });
-    video.addEventListener("canplay", () => { message.textContent = "Ready to play"; });
-    video.addEventListener("error", () => { message.textContent = "Could not play this MP4. Check the file format and server connection."; });
-  </script>
-</body>
-</html>
-"""
 
 HTTP_BLOCK_SIZE = 64 * 1024
 
@@ -61,12 +19,27 @@ class ProgressiveVideoHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
         address: tuple[str, int],
-        receiver: AudioReceiver,
-        transfer_id: bytes,
+        receiver: AudioReceiver | None = None,
+        transfer_id: bytes | None = None,
     ) -> None:
-        self.receiver = receiver
-        self.transfer_id = transfer_id
+        self._video_source_lock = threading.Lock()
+        self._receiver = receiver
+        self._transfer_id = transfer_id
         super().__init__(address, ProgressiveVideoRequestHandler)
+
+    def set_video_source(self, receiver: AudioReceiver, transfer_id: bytes) -> None:
+        with self._video_source_lock:
+            self._receiver = receiver
+            self._transfer_id = transfer_id
+
+    def clear_video_source(self) -> None:
+        with self._video_source_lock:
+            self._receiver = None
+            self._transfer_id = None
+
+    def get_video_source(self) -> tuple[AudioReceiver | None, bytes | None]:
+        with self._video_source_lock:
+            return self._receiver, self._transfer_id
 
 
 class ProgressiveVideoRequestHandler(BaseHTTPRequestHandler):
@@ -74,10 +47,9 @@ class ProgressiveVideoRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
-        request = urlsplit(self.path)
-        if request.path == "/player":
-            self._send_bytes(200, PLAYER_HTML.encode("utf-8"), "text/html; charset=utf-8")
-        elif request.path == "/video.mp4":
+        if urlsplit(self.path).path in {"/", "/player"}:
+            self._send_bytes(200, CLIENT_HTML.encode("utf-8"), "text/html; charset=utf-8")
+        elif urlsplit(self.path).path == "/video.mp4":
             self._serve_video()
         else:
             self._send_bytes(404, b"Not found", "text/plain; charset=utf-8")
@@ -89,11 +61,12 @@ class ProgressiveVideoRequestHandler(BaseHTTPRequestHandler):
             self._send_bytes(404, b"Not found", "text/plain; charset=utf-8")
 
     def _serve_video(self, send_body: bool = True) -> None:
-        snapshot = self.server.receiver.wait_for_transfer_bytes(
-            self.server.transfer_id,
-            1,
-            timeout=60,
-        )
+        receiver, transfer_id = self.server.get_video_source()
+        if receiver is None or transfer_id is None:
+            self._send_bytes(409, b"No video is open", "text/plain; charset=utf-8")
+            return
+
+        snapshot = receiver.wait_for_transfer_bytes(transfer_id, 1, timeout=60)
         if snapshot is None:
             self._send_bytes(504, b"Video transfer did not start", "text/plain; charset=utf-8")
             return
@@ -113,11 +86,7 @@ class ProgressiveVideoRequestHandler(BaseHTTPRequestHandler):
             return
 
         required_bytes = max(start + 1, min(snapshot.buffer_bytes, snapshot.size) if start == 0 else 0)
-        snapshot = self.server.receiver.wait_for_transfer_bytes(
-            self.server.transfer_id,
-            required_bytes,
-            timeout=60,
-        )
+        snapshot = receiver.wait_for_transfer_bytes(transfer_id, required_bytes, timeout=60)
         if snapshot is None:
             self._send_bytes(504, b"Video buffer timed out", "text/plain; charset=utf-8")
             return
@@ -140,11 +109,7 @@ class ProgressiveVideoRequestHandler(BaseHTTPRequestHandler):
 
         position = start
         while position <= end:
-            snapshot = self.server.receiver.wait_for_transfer_bytes(
-                self.server.transfer_id,
-                position + 1,
-                timeout=60,
-            )
+            snapshot = receiver.wait_for_transfer_bytes(transfer_id, position + 1, timeout=60)
             if snapshot is None or snapshot.error or snapshot.path is None:
                 return
             available_end = min(end + 1, snapshot.available_bytes)
@@ -206,39 +171,3 @@ class ProgressiveVideoRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         if len(args) > 1 and str(args[1]).startswith(("4", "5")):
             super().log_message(format, *args)
-
-
-def run_udp_video_player(host: str, port: int, name: str, download_directory: Path) -> None:
-    try:
-        import webview
-    except ImportError as error:
-        raise RuntimeError(f"The video player could not load its WebView2 component: {error}") from error
-
-    receiver = AudioReceiver(download_directory)
-    server: ProgressiveVideoHTTPServer | None = None
-    server_thread: threading.Thread | None = None
-    try:
-        receiver.connect(host, port)
-        transfer_id = receiver.request_file(name)
-        server = ProgressiveVideoHTTPServer(("127.0.0.1", 0), receiver, transfer_id)
-        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-        server_thread.start()
-        player_url = f"http://127.0.0.1:{server.server_address[1]}/player?name={quote(name)}"
-        try:
-            webview.create_window(
-                f"Audionator · {name}",
-                url=player_url,
-                width=1100,
-                height=720,
-                min_size=(760, 480),
-            )
-            webview.start()
-        except (RuntimeError, webview.errors.WebViewException) as error:
-            raise RuntimeError(f"The video player could not start: {error}") from error
-    finally:
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-        if server_thread is not None:
-            server_thread.join(timeout=2)
-        receiver.close()

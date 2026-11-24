@@ -8,7 +8,7 @@ The standalone Windows `.exe` files bundle Python and the application packages, 
 
 - Python 3.10 or later
 - `pygame` for MP3 playback and `mutagen` for track duration and seeking in the client
-- `pywebview` and Microsoft Edge WebView2 Runtime for the desktop video player
+- `pywebview` and Microsoft Edge WebView2 Runtime for the desktop client window and built-in video player
 - `imageio-ffmpeg` for preparing MP4 files for progressive playback
 
 ## Build standalone Windows apps
@@ -17,7 +17,7 @@ On the Windows development computer, double-click `build-windows.bat` in this pr
 
 It builds two standalone apps in `dist`:
 
-- `Audionator.exe` is the client. Copy it to a receiving computer and double-click it; that computer does not need Python installed. Video playback requires the Microsoft Edge WebView2 Runtime.
+- `Audionator.exe` is the client. Copy it to a receiving computer and double-click it; that computer does not need Python installed. The app window and built-in video player use Microsoft Edge WebView2.
 - `AudionatorServer.exe` is the media server. Put it beside a `music` folder containing MP3 files and a `videos` folder containing MP4 files, then double-click it. Its console window stays open while the server is running; close that window to stop the server. Audio and video both use UDP port `5005`.
 
 The server computer does not need Python installed either. Windows Firewall may ask to allow the server; permit it on **Private networks only** for UDP port `5005`. The server and client should be used only on a trusted local network.
@@ -45,7 +45,7 @@ python -m pip install -r requirements.txt
    python client.py
    ```
 
-4. Enter the server computer's address (`127.0.0.1` only when client and server are on the same computer) and select **Connect**. Choose a song in the **Audio** tab and select **Receive & play**, or choose a video in the **Videos** tab and select **Play video**. Video starts after a short buffer and continues receiving over UDP.
+4. Enter the server computer's address (`127.0.0.1` only when client and server are on the same computer) and select **Connect**. The client remembers the last server on that device. Browse **Music** and play a track, or open **Videos** and choose a video to play inline in the same window. Video starts after a short buffer and continues receiving over UDP.
 
 Received MP3 tracks are saved to `received`. MP4 files remain on the server. The first play prepares a fast-start copy without re-encoding; video packets are retransmitted if lost, and playback pauses to buffer if the connection falls behind.
 

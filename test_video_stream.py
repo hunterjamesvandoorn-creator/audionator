@@ -5,15 +5,15 @@ import tempfile
 import threading
 import time
 import unittest
-import queue
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 import imageio_ffmpeg
 
-from receiver import AudioReceiver, TransferSnapshot
+from client import AudionatorAPI
+from receiver import TransferSnapshot
 from server import AudioUDPServer
-from video_stream import PLAYER_HTML, ProgressiveVideoHTTPServer
+from video_stream import ProgressiveVideoHTTPServer
 
 
 class FakeProgressiveReceiver:
@@ -78,9 +78,10 @@ class ProgressiveVideoHTTPTests(unittest.TestCase):
             transfer_thread = threading.Thread(target=continue_transfer, daemon=True)
             transfer_thread.start()
             try:
-                with urlopen(f"{base_url}/player?name=video.mp4", timeout=5) as response:
+                with urlopen(base_url, timeout=5) as response:
                     player_page = response.read().decode("utf-8")
-                self.assertIn("UDP VIDEO", player_page)
+                self.assertIn('data-view="videos"', player_page)
+                self.assertIn('id="video-player"', player_page)
                 with urlopen(f"{base_url}/video.mp4", timeout=5) as response:
                     self.assertEqual(response.headers.get("Content-Length"), str(len(content)))
                     first_bytes = response.read(3)
@@ -142,28 +143,49 @@ class VideoUDPTransferTests(unittest.TestCase):
             server = AudioUDPServer(("127.0.0.1", 0), music, videos, root / "video-cache")
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
-            receiver = AudioReceiver(downloads)
+            player_server = ProgressiveVideoHTTPServer(("127.0.0.1", 0))
+            player_thread = threading.Thread(target=player_server.serve_forever, daemon=True)
+            player_thread.start()
+            client = AudionatorAPI(downloads, player_server, root / "settings.json")
             try:
-                receiver.connect("127.0.0.1", server.server_address[1])
-                receiver.request_file(source.name)
-                deadline = time.monotonic() + 30
-                received_path: Path | None = None
-                while time.monotonic() < deadline and received_path is None:
-                    try:
-                        event, payload = receiver.events.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
-                    if event == "error":
-                        self.fail(payload["message"])
-                    if event == "transfer_complete":
-                        received_path = Path(payload["path"])
-
-                self.assertIsNotNone(received_path, "MP4 transfer did not complete over UDP.")
-                assert received_path is not None
-                prepared = received_path.read_bytes()
+                self.assertTrue(client.connect("127.0.0.1", server.server_address[1])["ok"])
+                self.assertEqual(
+                    client.get_saved_connection(),
+                    {"host": "127.0.0.1", "port": server.server_address[1]},
+                )
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not client.get_state()["connected"]:
+                    time.sleep(0.05)
+                self.assertTrue(client.get_state()["connected"], "Client did not load the server library.")
+                self.assertTrue(client.play_video(source.name)["ok"])
+                receiver, transfer_id = player_server.get_video_source()
+                self.assertIsNotNone(receiver)
+                self.assertIsNotNone(transfer_id)
+                assert receiver is not None and transfer_id is not None
+                snapshot = receiver.wait_for_transfer_bytes(transfer_id, 1, timeout=30)
+                self.assertIsNotNone(snapshot, "Video transfer did not start.")
+                assert snapshot is not None
+                complete = receiver.wait_for_transfer_bytes(transfer_id, snapshot.size, timeout=30)
+                self.assertIsNotNone(complete, "Video transfer did not complete.")
+                assert complete is not None and complete.path is not None
+                with urlopen(f"http://127.0.0.1:{player_server.server_address[1]}/", timeout=5) as response:
+                    player_page = response.read().decode("utf-8")
+                self.assertIn('id="video-player"', player_page)
+                with urlopen(f"http://127.0.0.1:{player_server.server_address[1]}/video.mp4", timeout=5) as response:
+                    prepared = response.read()
+                self.assertEqual(prepared, complete.path.read_bytes())
                 self.assertLess(prepared.find(b"moov"), prepared.find(b"mdat"))
             finally:
-                receiver.close()
+                client.shutdown()
+                player_server.shutdown()
+                player_server.server_close()
+                player_thread.join(timeout=2)
+                transfer_deadline = time.monotonic() + 3
+                while time.monotonic() < transfer_deadline:
+                    with server._transfers_lock:
+                        if not server._transfers:
+                            break
+                    time.sleep(0.05)
                 server.shutdown()
                 server.server_close()
                 server_thread.join(timeout=2)
