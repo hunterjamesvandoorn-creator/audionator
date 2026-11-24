@@ -5,11 +5,22 @@ import threading
 import time
 import unittest
 import queue
+import socket
+import uuid
 from pathlib import Path
 
 from receiver import AudioReceiver
 from server import AudioUDPServer
-from udp_protocol import CONTROL, DATA, encode_control, pack_message, unpack_message
+from udp_protocol import (
+    ACK,
+    CONTROL,
+    DATA,
+    FINAL_ACK_SEQUENCE,
+    FIN,
+    encode_control,
+    pack_message,
+    unpack_message,
+)
 
 
 class UDPProtocolTests(unittest.TestCase):
@@ -85,6 +96,31 @@ class UDPTransferTests(unittest.TestCase):
         self.assertIsNotNone(received_path, "MP3 transfer did not complete.")
         assert received_path is not None
         self.assertEqual(received_path.read_bytes(), self.original_data)
+
+    def test_transfer_stays_on_the_server_udp_port(self) -> None:
+        transfer_id = uuid.uuid4().bytes
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.bind(("127.0.0.1", 0))
+            client.settimeout(3)
+            client.sendto(
+                pack_message(CONTROL, transfer_id, payload=encode_control({"command": "GET", "name": "test track.mp3"})),
+                self.server.server_address,
+            )
+            final_acknowledged = False
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not final_acknowledged:
+                packet, address = client.recvfrom(2048)
+                self.assertEqual(address[1], self.server.server_address[1])
+                kind, received_id, sequence, _ = unpack_message(packet)
+                self.assertEqual(received_id, transfer_id)
+                if kind == DATA:
+                    client.sendto(pack_message(ACK, transfer_id, sequence), address)
+                elif kind == FIN:
+                    client.sendto(pack_message(ACK, transfer_id, FINAL_ACK_SEQUENCE), address)
+                    final_acknowledged = True
+                else:
+                    self.assertEqual(kind, CONTROL)
+            self.assertTrue(final_acknowledged, "Server did not complete the UDP transfer.")
 
 
 class SeparateMediaDirectoryTests(unittest.TestCase):

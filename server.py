@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import queue
 import socket
 import socketserver
 import threading
@@ -50,7 +51,34 @@ class AudioUDPServer(socketserver.ThreadingUDPServer):
         self.library.mkdir(parents=True, exist_ok=True)
         self.video_library.mkdir(parents=True, exist_ok=True)
         self.video_service = VideoPreparationService(self.video_library, video_cache_directory)
+        self._transfers_lock = threading.Lock()
+        self._transfers: dict[bytes, tuple[tuple[str, int], queue.Queue[tuple[int, tuple[str, int]]]]] = {}
         super().__init__(address, AudioUDPHandler)
+
+    def register_transfer(
+        self,
+        transfer_id: bytes,
+        client_address: tuple[str, int],
+    ) -> queue.Queue[tuple[int, tuple[str, int]]]:
+        acknowledgements: queue.Queue[tuple[int, tuple[str, int]]] = queue.Queue()
+        with self._transfers_lock:
+            self._transfers[transfer_id] = (client_address, acknowledgements)
+        return acknowledgements
+
+    def unregister_transfer(self, transfer_id: bytes) -> None:
+        with self._transfers_lock:
+            self._transfers.pop(transfer_id, None)
+
+    def route_acknowledgement(
+        self,
+        transfer_id: bytes,
+        sequence: int,
+        client_address: tuple[str, int],
+    ) -> None:
+        with self._transfers_lock:
+            transfer = self._transfers.get(transfer_id)
+        if transfer and transfer[0] == client_address:
+            transfer[1].put((sequence, client_address))
 
 
 class AudioUDPHandler(socketserver.BaseRequestHandler):
@@ -60,9 +88,15 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         packet, _server_socket = self.request
         client_address = self.client_address
         try:
-            kind, transfer_id, _, payload = unpack_message(packet)
-            if kind != CONTROL:
-                return
+            kind, transfer_id, sequence, payload = unpack_message(packet)
+        except ValueError:
+            return
+        if kind == ACK:
+            self.server.route_acknowledgement(transfer_id, sequence, client_address)
+            return
+        if kind != CONTROL:
+            return
+        try:
             message = decode_control(payload)
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             return
@@ -168,95 +202,87 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         digest = self._sha256(path)
         media_type = "video" if path.suffix.lower() == ".mp4" else "audio"
         buffer_bytes = min(size, VIDEO_START_BUFFER_BYTES) if media_type == "video" else 0
-        self._send_control(
-            client_address,
-            transfer_id,
-            {
-                "type": "START",
-                "name": path.name,
-                "size": size,
-                "chunk_size": CHUNK_SIZE,
-                "chunks": chunks,
-                "sha256": digest,
-                "media_type": media_type,
-                "buffer_bytes": buffer_bytes,
-            },
-        )
+        acknowledgements = self.server.register_transfer(transfer_id, client_address)
         pending: dict[int, tuple[bytes, float, int]] = {}
         next_sequence = 0
         acknowledged: set[int] = set()
         last_activity = time.monotonic()
 
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as transfer_socket, path.open("rb") as audio_file:
-            transfer_socket.settimeout(0.1)
-            while len(acknowledged) < chunks:
-                while next_sequence < chunks and len(pending) < WINDOW_SIZE:
-                    audio_file.seek(next_sequence * CHUNK_SIZE)
-                    chunk = audio_file.read(CHUNK_SIZE)
-                    packet = pack_message(DATA, transfer_id, next_sequence, chunk)
-                    transfer_socket.sendto(packet, client_address)
-                    pending[next_sequence] = (packet, time.monotonic(), 0)
-                    next_sequence += 1
-
-                try:
-                    response, response_address = transfer_socket.recvfrom(1024)
-                    if response_address != client_address:
-                        continue
-                    kind, response_id, sequence, _ = unpack_message(response)
-                    if kind == ACK and response_id == transfer_id and sequence in pending:
-                        del pending[sequence]
-                        acknowledged.add(sequence)
-                        last_activity = time.monotonic()
-                except socket.timeout:
-                    pass
-                except ValueError:
-                    continue
-
-                now = time.monotonic()
-                for sequence, (packet, sent_at, retries) in list(pending.items()):
-                    if now - sent_at < RETRY_INTERVAL:
-                        continue
-                    if retries >= MAX_RETRIES:
-                        self._send_control(
-                            client_address,
-                            transfer_id,
-                            {"type": "ERROR", "message": "Media transfer stopped after repeated packet loss."},
-                        )
-                        return
-                    transfer_socket.sendto(packet, client_address)
-                    pending[sequence] = (packet, now, retries + 1)
-
-                if now - last_activity > TRANSFER_TIMEOUT:
-                    self._send_control(
-                        client_address,
-                        transfer_id,
-                        {"type": "ERROR", "message": "Media transfer timed out waiting for the client."},
-                    )
-                    return
-
-            final_packet = pack_message(FIN, transfer_id, chunks, digest.encode("ascii"))
-            for _ in range(MAX_RETRIES):
-                transfer_socket.sendto(final_packet, client_address)
-                try:
-                    response, response_address = transfer_socket.recvfrom(1024)
-                    if response_address != client_address:
-                        continue
-                    kind, response_id, sequence, _ = unpack_message(response)
-                    if (
-                        kind == ACK
-                        and response_id == transfer_id
-                        and sequence == FINAL_ACK_SEQUENCE
-                    ):
-                        return
-                except socket.timeout:
-                    continue
-                except ValueError:
-                    continue
+        try:
             self._send_control(
                 client_address,
                 transfer_id,
-                {"type": "ERROR", "message": "Server could not confirm the completed media transfer."},
+                {
+                    "type": "START",
+                    "name": path.name,
+                    "size": size,
+                    "chunk_size": CHUNK_SIZE,
+                    "chunks": chunks,
+                    "sha256": digest,
+                    "media_type": media_type,
+                    "buffer_bytes": buffer_bytes,
+                },
             )
+            with path.open("rb") as audio_file:
+                while len(acknowledged) < chunks:
+                    while next_sequence < chunks and len(pending) < WINDOW_SIZE:
+                        audio_file.seek(next_sequence * CHUNK_SIZE)
+                        chunk = audio_file.read(CHUNK_SIZE)
+                        packet = pack_message(DATA, transfer_id, next_sequence, chunk)
+                        self.server.socket.sendto(packet, client_address)
+                        pending[next_sequence] = (packet, time.monotonic(), 0)
+                        next_sequence += 1
+
+                    try:
+                        sequence, response_address = acknowledgements.get(timeout=0.1)
+                        if response_address == client_address and sequence in pending:
+                            del pending[sequence]
+                            acknowledged.add(sequence)
+                            last_activity = time.monotonic()
+                    except queue.Empty:
+                        pass
+
+                    now = time.monotonic()
+                    for sequence, (packet, sent_at, retries) in list(pending.items()):
+                        if now - sent_at < RETRY_INTERVAL:
+                            continue
+                        if retries >= MAX_RETRIES:
+                            self._send_control(
+                                client_address,
+                                transfer_id,
+                                {"type": "ERROR", "message": "Media transfer stopped after repeated packet loss."},
+                            )
+                            return
+                        self.server.socket.sendto(packet, client_address)
+                        pending[sequence] = (packet, now, retries + 1)
+
+                    if now - last_activity > TRANSFER_TIMEOUT:
+                        self._send_control(
+                            client_address,
+                            transfer_id,
+                            {"type": "ERROR", "message": "Media transfer timed out waiting for the client."},
+                        )
+                        return
+
+                final_packet = pack_message(FIN, transfer_id, chunks, digest.encode("ascii"))
+                for _ in range(MAX_RETRIES):
+                    self.server.socket.sendto(final_packet, client_address)
+                    try:
+                        sequence, response_address = acknowledgements.get(timeout=0.1)
+                        if (
+                            response_address == client_address
+                            and sequence == FINAL_ACK_SEQUENCE
+                        ):
+                            return
+                    except queue.Empty:
+                        continue
+                self._send_control(
+                    client_address,
+                    transfer_id,
+                    {"type": "ERROR", "message": "Server could not confirm the completed media transfer."},
+                )
+        finally:
+            self.server.unregister_transfer(transfer_id)
 
     @staticmethod
     def _sha256(path: Path) -> str:

@@ -2,7 +2,7 @@
 
 The GitHub Pages site is a static UI preview. Raw UDP is not available to web pages, so audio sharing runs in the separate Windows server and client apps.
 
-The standalone Windows `.exe` files run without Python. The following requirements apply only when running from Python source or building the apps.
+The standalone Windows `.exe` files bundle Python and the application packages, so users do not need to install Python or run `pip install`. The following requirements apply only when running from Python source or building the apps. Video playback uses the Microsoft Edge WebView2 Runtime, which may need to be installed separately on older Windows systems.
 
 ## Python source requirements
 
@@ -57,7 +57,7 @@ Start the server on the computer that has the MP3 and MP4 files, binding it to t
 python server.py --udp --host 0.0.0.0 --port 5005 --library .\music --video-library .\videos
 ```
 
-If Windows Firewall prompts you, allow Python on **Private networks only** for UDP port `5005`. In the client, enter the server computer's local IPv4 address (find it with `ipconfig`) and port `5005`.
+If Windows Firewall prompts you, allow the server on **Private networks only** for UDP port `5005`. All media packets and acknowledgements use this same port. In the client, enter the server computer's local IPv4 address (find it with `ipconfig`) and port `5005`.
 
 MP3 files transfer as numbered UDP chunks, retry missing chunks, and verify the completed file with SHA-256 before playback. The client includes a seek slider with elapsed and total time. Audio playback begins after the whole track arrives. MP4 video is remuxed by FFmpeg to put its metadata at the start, then sent in reliable UDP chunks; the video player can begin after up to 2 MB has buffered and pauses if it needs more data. The prototype has no authentication or encryption: use it only on a trusted local network, not the public internet.
 
