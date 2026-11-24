@@ -25,20 +25,31 @@ from udp_protocol import (
     pack_message,
     unpack_message,
 )
+from video_service import VideoPreparationService
 
 
 TRANSFER_TIMEOUT = 30.0
 RETRY_INTERVAL = 0.35
 MAX_RETRIES = 30
+VIDEO_START_BUFFER_BYTES = 2 * 1024 * 1024
 
 
 class AudioUDPServer(socketserver.ThreadingUDPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], library: Path) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        library: Path,
+        video_library: Path | None = None,
+        video_cache_directory: Path | None = None,
+    ) -> None:
         self.library = library.resolve()
+        self.video_library = (video_library or library).resolve()
         self.library.mkdir(parents=True, exist_ok=True)
+        self.video_library.mkdir(parents=True, exist_ok=True)
+        self.video_service = VideoPreparationService(self.video_library, video_cache_directory)
         super().__init__(address, AudioUDPHandler)
 
 
@@ -63,23 +74,36 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                 transfer_id,
                 {
                     "type": "LIST",
-                    "files": [
-                        {"name": path.name, "size": path.stat().st_size}
-                        for path in sorted(self.server.library.iterdir(), key=lambda item: item.name.lower())
-                        if path.is_file() and path.suffix.lower() == ".mp3"
-                    ],
+                    "files": sorted(
+                        [
+                            {
+                                "name": path.name,
+                                "size": path.stat().st_size,
+                                "type": media_type,
+                            }
+                            for directory, extension, media_type in (
+                                (self.server.library, ".mp3", "audio"),
+                                (self.server.video_library, ".mp4", "video"),
+                            )
+                            for path in directory.iterdir()
+                            if path.is_file() and path.suffix.lower() == extension
+                        ],
+                        key=lambda item: item["name"].lower(),
+                    ),
                 },
             )
         elif command == "GET":
             name = message.get("name")
             try:
-                audio_path = self._find_audio_file(name)
-            except (OSError, ValueError) as error:
+                path, media_type = self._find_media_file(name)
+                if media_type == "video":
+                    path = self.server.video_service.prepare(path.name)
+            except (OSError, RuntimeError, ValueError) as error:
                 self._send_control(client_address, transfer_id, {"type": "ERROR", "message": str(error)})
                 return
             threading.Thread(
                 target=self._send_file,
-                args=(audio_path, transfer_id, client_address),
+                args=(path, transfer_id, client_address),
                 daemon=True,
             ).start()
         else:
@@ -89,16 +113,23 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                 {"type": "ERROR", "message": "Unknown server command."},
             )
 
-    def _find_audio_file(self, name: Any) -> Path:
+    def _find_media_file(self, name: Any) -> tuple[Path, str]:
         if not isinstance(name, str) or not name or Path(name).name != name or "\x00" in name:
-            raise ValueError("Invalid audio file name.")
-        if Path(name).suffix.lower() != ".mp3":
-            raise ValueError("Only MP3 files are available.")
-        library = self.server.library.resolve()
+            raise ValueError("Invalid media file name.")
+        extension = Path(name).suffix.lower()
+        if extension == ".mp3":
+            library = self.server.library
+            media_type = "audio"
+        elif extension == ".mp4":
+            library = self.server.video_library
+            media_type = "video"
+        else:
+            raise ValueError("Only MP3 audio and MP4 video files are available.")
+        library = library.resolve()
         path = (library / name).resolve()
         if path.parent != library or not path.is_file():
-            raise ValueError("That MP3 is not in the server library.")
-        return path
+            raise ValueError("That file is not in the server's media library.")
+        return path, media_type
 
     def _send_control(
         self,
@@ -123,7 +154,7 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
             self._send_control(
                 client_address,
                 transfer_id,
-                {"type": "ERROR", "message": f"MP3 transfer failed: {error}"},
+                {"type": "ERROR", "message": f"Media transfer failed: {error}"},
             )
 
     def _transfer_file(
@@ -135,6 +166,8 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         size = path.stat().st_size
         chunks = (size + CHUNK_SIZE - 1) // CHUNK_SIZE
         digest = self._sha256(path)
+        media_type = "video" if path.suffix.lower() == ".mp4" else "audio"
+        buffer_bytes = min(size, VIDEO_START_BUFFER_BYTES) if media_type == "video" else 0
         self._send_control(
             client_address,
             transfer_id,
@@ -145,6 +178,8 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                 "chunk_size": CHUNK_SIZE,
                 "chunks": chunks,
                 "sha256": digest,
+                "media_type": media_type,
+                "buffer_bytes": buffer_bytes,
             },
         )
         pending: dict[int, tuple[bytes, float, int]] = {}
@@ -185,7 +220,7 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                         self._send_control(
                             client_address,
                             transfer_id,
-                            {"type": "ERROR", "message": "MP3 transfer stopped after repeated packet loss."},
+                            {"type": "ERROR", "message": "Media transfer stopped after repeated packet loss."},
                         )
                         return
                     transfer_socket.sendto(packet, client_address)
@@ -195,7 +230,7 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                     self._send_control(
                         client_address,
                         transfer_id,
-                        {"type": "ERROR", "message": "MP3 transfer timed out waiting for the client."},
+                        {"type": "ERROR", "message": "Media transfer timed out waiting for the client."},
                     )
                     return
 
@@ -220,7 +255,7 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
             self._send_control(
                 client_address,
                 transfer_id,
-                {"type": "ERROR", "message": "Server could not confirm the completed MP3 transfer."},
+                {"type": "ERROR", "message": "Server could not confirm the completed media transfer."},
             )
 
     @staticmethod
@@ -232,10 +267,19 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         return digest.hexdigest()
 
 
-def run_udp_server(host: str, port: int, library: Path) -> None:
-    server = AudioUDPServer((host, port), library)
-    print(f"Audionator UDP server listening on {host}:{port}")
-    print(f"MP3 library: {server.library}")
+def run_udp_server(
+    host: str,
+    port: int,
+    library: Path,
+    video_library: Path | None = None,
+) -> None:
+    if not 1 <= port <= 65535:
+        raise ValueError("UDP port must be between 1 and 65535.")
+    server = AudioUDPServer((host, port), library, video_library)
+    print(f"Audionator reliable UDP server listening on {host}:{port}")
+    print(f"Audio library: {server.library}")
+    print(f"Video library: {server.video_library}")
+    print("MP4 videos are prepared for progressive playback the first time a client opens them.")
     print("Share the server computer's LAN IP with the receiving client. Press Ctrl+C to stop.")
     try:
         server.serve_forever()
@@ -260,7 +304,7 @@ def run_web_preview(host: str, port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Audionator preview or MP3 UDP server.")
-    parser.add_argument("--udp", action="store_true", help="Serve MP3 files over UDP instead of the web preview.")
+    parser.add_argument("--udp", action="store_true", help="Serve media over reliable UDP instead of the web preview.")
     parser.add_argument("--host", default=None, help="Bind address (default: localhost)")
     parser.add_argument("--port", type=int, default=None, help="Port (UDP default: 5005; web default: 8000)")
     parser.add_argument(
@@ -269,12 +313,18 @@ def main() -> None:
         default=Path(__file__).resolve().parent / "music",
         help="Folder containing MP3 files (UDP mode only)",
     )
+    parser.add_argument(
+        "--video-library",
+        type=Path,
+        default=Path(__file__).resolve().parent / "videos",
+        help="Folder containing MP4 files (UDP mode only)",
+    )
     args = parser.parse_args()
 
     host = args.host or "127.0.0.1"
     port = args.port or (5005 if args.udp else 8000)
     if args.udp:
-        run_udp_server(host, port, args.library)
+        run_udp_server(host, port, args.library, args.video_library)
     else:
         run_web_preview(host, port)
 

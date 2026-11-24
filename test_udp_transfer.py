@@ -36,7 +36,8 @@ class UDPTransferTests(unittest.TestCase):
         self.library.mkdir()
         self.original_data = bytes(range(256)) * 300
         (self.library / "test track.mp3").write_bytes(self.original_data)
-        self.server = AudioUDPServer(("127.0.0.1", 0), self.library)
+        (self.library / "sample video.mp4").write_bytes(b"placeholder")
+        self.server = AudioUDPServer(("127.0.0.1", 0), self.library, video_cache_directory=root / "video-cache")
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
         self.receiver = AudioReceiver(self.downloads)
@@ -59,7 +60,13 @@ class UDPTransferTests(unittest.TestCase):
                 continue
             if event == "library":
                 listed = True
-                self.assertEqual(payload["files"], [{"name": "test track.mp3", "size": len(self.original_data)}])
+                self.assertEqual(
+                    payload["files"],
+                    [
+                        {"name": "sample video.mp4", "size": len(b"placeholder"), "type": "video"},
+                        {"name": "test track.mp3", "size": len(self.original_data), "type": "audio"},
+                    ],
+                )
         self.assertTrue(listed, "Server did not return its MP3 library.")
 
         self.receiver.request_file("test track.mp3")
@@ -78,6 +85,54 @@ class UDPTransferTests(unittest.TestCase):
         self.assertIsNotNone(received_path, "MP3 transfer did not complete.")
         assert received_path is not None
         self.assertEqual(received_path.read_bytes(), self.original_data)
+
+
+class SeparateMediaDirectoryTests(unittest.TestCase):
+    def test_lists_audio_and_video_from_separate_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            music = root / "music"
+            videos = root / "videos"
+            music.mkdir()
+            videos.mkdir()
+            (music / "track.mp3").write_bytes(b"audio")
+            (videos / "clip.mp4").write_bytes(b"video")
+
+            server = AudioUDPServer(
+                ("127.0.0.1", 0),
+                music,
+                videos,
+                root / "video-cache",
+            )
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            receiver = AudioReceiver(root / "downloads")
+            try:
+                receiver.connect("127.0.0.1", server.server_address[1])
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        event, payload = receiver.events.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if event == "library":
+                        self.assertEqual(
+                            payload["files"],
+                            [
+                                {"name": "clip.mp4", "size": 5, "type": "video"},
+                                {"name": "track.mp3", "size": 5, "type": "audio"},
+                            ],
+                        )
+                        break
+                    if event == "error":
+                        self.fail(payload["message"])
+                else:
+                    self.fail("Server did not return media from both directories.")
+            finally:
+                receiver.close()
+                server.shutdown()
+                server.server_close()
+                server_thread.join(timeout=2)
 
 
 if __name__ == "__main__":

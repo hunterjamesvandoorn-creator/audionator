@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,16 @@ from udp_protocol import (
 )
 
 
+@dataclass(frozen=True)
+class TransferSnapshot:
+    path: Path | None
+    size: int
+    available_bytes: int
+    buffer_bytes: int
+    complete: bool
+    error: str | None
+
+
 class AudioReceiver:
     def __init__(self, download_directory: Path | None = None) -> None:
         self.download_directory = download_directory or Path(__file__).resolve().parent / "received"
@@ -32,6 +43,9 @@ class AudioReceiver:
         self._server_address: tuple[str, int] | None = None
         self._thread: threading.Thread | None = None
         self._transfers: dict[bytes, dict[str, Any]] = {}
+        self._transfer_errors: dict[bytes, str] = {}
+        self._completed_transfers: set[bytes] = set()
+        self._condition = threading.Condition()
 
     @property
     def is_running(self) -> bool:
@@ -64,21 +78,77 @@ class AudioReceiver:
         self._send_control({"command": "GET", "name": name}, transfer_id)
         return transfer_id
 
+    def wait_for_transfer_bytes(
+        self,
+        transfer_id: bytes,
+        minimum_bytes: int,
+        timeout: float | None = None,
+    ) -> TransferSnapshot | None:
+        if minimum_bytes < 0:
+            raise ValueError("The requested buffer size cannot be negative.")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while True:
+                state = self._transfers.get(transfer_id)
+                if state:
+                    snapshot = self._snapshot(state)
+                    if (
+                        state["error"]
+                        or state["complete"]
+                        or state["available_bytes"] >= minimum_bytes
+                    ):
+                        return snapshot
+                elif transfer_id in self._transfer_errors:
+                    return TransferSnapshot(
+                        None,
+                        0,
+                        0,
+                        0,
+                        False,
+                        self._transfer_errors[transfer_id],
+                    )
+
+                if self._stop.is_set():
+                    return TransferSnapshot(None, 0, 0, 0, False, "Video receiver stopped.")
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+
+    @staticmethod
+    def _snapshot(state: dict[str, Any]) -> TransferSnapshot:
+        return TransferSnapshot(
+            state["temporary_path"],
+            state["size"],
+            state["available_bytes"],
+            state["buffer_bytes"],
+            state["complete"],
+            state["error"],
+        )
+
     def close(self) -> None:
         self._stop.set()
+        with self._condition:
+            transfers = list(self._transfers.values())
+            self._transfers.clear()
+            self._condition.notify_all()
         if self._socket:
             self._socket.close()
             self._socket = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1)
-        for state in self._transfers.values():
+        for state in transfers:
             stream = state.get("stream")
-            if stream:
+            if stream and not stream.closed:
                 stream.close()
             temporary_path = state.get("temporary_path")
             if temporary_path:
                 temporary_path.unlink(missing_ok=True)
-        self._transfers.clear()
+        self._transfer_errors.clear()
+        self._completed_transfers.clear()
 
     def _send_control(self, message: dict[str, Any], transfer_id: bytes = bytes(16)) -> None:
         if not self._socket or not self._server_address:
@@ -117,11 +187,17 @@ class AudioReceiver:
             elif response_type == "START":
                 self._start_transfer(transfer_id, message)
             elif response_type == "ERROR":
-                self._discard_transfer(transfer_id)
-                self.events.put(("error", {"message": str(message.get("message", "Server error"))}))
+                error = str(message.get("message", "Server error"))
+                self._discard_transfer(transfer_id, error)
+                self.events.put(("error", {"message": error}))
             return
 
-        state = self._transfers.get(transfer_id)
+        with self._condition:
+            state = self._transfers.get(transfer_id)
+            complete = transfer_id in self._completed_transfers
+        if kind == FIN and complete:
+            sock.sendto(pack_message(ACK, transfer_id, FINAL_ACK_SEQUENCE), address)
+            return
         if not state:
             return
 
@@ -137,10 +213,16 @@ class AudioReceiver:
         chunk_size = message.get("chunk_size")
         chunk_count = message.get("chunks")
         digest = message.get("sha256")
+        media_type = message.get("media_type")
+        buffer_bytes = message.get("buffer_bytes", 0)
+        if media_type is None and isinstance(name, str):
+            media_type = "video" if name.lower().endswith(".mp4") else "audio"
         if (
             not isinstance(name, str)
             or Path(name).name != name
-            or not name.lower().endswith(".mp3")
+            or media_type not in {"audio", "video"}
+            or (media_type == "audio" and not name.lower().endswith(".mp3"))
+            or (media_type == "video" and not name.lower().endswith(".mp4"))
             or not isinstance(size, int)
             or size < 0
             or not isinstance(chunk_size, int)
@@ -148,6 +230,8 @@ class AudioReceiver:
             or not isinstance(chunk_count, int)
             or chunk_count < 0
             or not isinstance(digest, str)
+            or not isinstance(buffer_bytes, int)
+            or not 0 <= buffer_bytes <= size
         ):
             raise ValueError("Server supplied invalid transfer details.")
 
@@ -155,24 +239,43 @@ class AudioReceiver:
         temporary_path = self.download_directory / f".{transfer_id.hex()}.part"
         stream = temporary_path.open("w+b")
         stream.truncate(size)
-        self._transfers[transfer_id] = {
+        state = {
             "name": name,
+            "media_type": media_type,
             "size": size,
             "chunk_size": chunk_size,
             "chunks": chunk_count,
+            "buffer_bytes": buffer_bytes,
             "sha256": digest,
             "received": set(),
+            "next_contiguous_chunk": 0,
+            "available_bytes": 0,
             "stream": stream,
             "temporary_path": temporary_path,
             "last_progress": 0.0,
+            "complete": False,
+            "error": None,
+            "finishing": False,
         }
+        with self._condition:
+            self._transfer_errors.pop(transfer_id, None)
+            self._transfers[transfer_id] = state
+            self._condition.notify_all()
         self.events.put(("transfer_started", {"name": name, "size": size, "id": transfer_id.hex()}))
 
-    def _discard_transfer(self, transfer_id: bytes) -> None:
-        state = self._transfers.pop(transfer_id, None)
+    def _discard_transfer(self, transfer_id: bytes, error: str) -> None:
+        with self._condition:
+            state = self._transfers.get(transfer_id)
+            self._transfer_errors[transfer_id] = error
+            if state:
+                state["error"] = error
+                if state["media_type"] != "video":
+                    self._transfers.pop(transfer_id, None)
+            self._condition.notify_all()
         if not state:
             return
-        state["stream"].close()
+        if not state["stream"].closed:
+            state["stream"].close()
         state["temporary_path"].unlink(missing_ok=True)
 
     def _write_chunk(self, state: dict[str, Any], sequence: int, payload: bytes) -> None:
@@ -184,11 +287,21 @@ class AudioReceiver:
         )
         if len(payload) != expected_length:
             return
-        stream = state["stream"]
-        if sequence not in state["received"]:
+        with self._condition:
+            if state["error"] or state["complete"] or sequence in state["received"]:
+                return
+            stream = state["stream"]
             stream.seek(sequence * state["chunk_size"])
             stream.write(payload)
+            stream.flush()
             state["received"].add(sequence)
+            while state["next_contiguous_chunk"] in state["received"]:
+                state["next_contiguous_chunk"] += 1
+            state["available_bytes"] = min(
+                state["next_contiguous_chunk"] * state["chunk_size"],
+                state["size"],
+            )
+            self._condition.notify_all()
             now = time.monotonic()
             if now - state["last_progress"] >= 0.1 or len(state["received"]) == state["chunks"]:
                 state["last_progress"] = now
@@ -213,13 +326,20 @@ class AudioReceiver:
         digest: bytes,
         address: tuple[str, int],
     ) -> None:
-        state = self._transfers.get(transfer_id)
-        if not state or sequence != state["chunks"] or len(state["received"]) != state["chunks"]:
-            return
-        stream = state["stream"]
-        stream.flush()
-        stream.close()
-        temporary_path: Path = state["temporary_path"]
+        with self._condition:
+            state = self._transfers.get(transfer_id)
+            if (
+                not state
+                or state["finishing"]
+                or sequence != state["chunks"]
+                or len(state["received"]) != state["chunks"]
+            ):
+                return
+            state["finishing"] = True
+            stream = state["stream"]
+            stream.flush()
+            stream.close()
+            temporary_path: Path = state["temporary_path"]
         hasher = hashlib.sha256()
         with temporary_path.open("rb") as received_file:
             for block in iter(lambda: received_file.read(1024 * 1024), b""):
@@ -227,13 +347,35 @@ class AudioReceiver:
         actual_digest = hasher.hexdigest()
         if digest.decode("ascii") != state["sha256"] or actual_digest != state["sha256"]:
             temporary_path.unlink(missing_ok=True)
-            del self._transfers[transfer_id]
-            self.events.put(("error", {"message": f"Integrity check failed for {state['name']}."}))
+            error = f"Integrity check failed for {state['name']}."
+            with self._condition:
+                state["error"] = error
+                self._transfer_errors[transfer_id] = error
+                if state["media_type"] != "video":
+                    self._transfers.pop(transfer_id, None)
+                self._condition.notify_all()
+            self.events.put(("error", {"message": error}))
+            return
+
+        if state["media_type"] == "video":
+            with self._condition:
+                state["complete"] = True
+                state["available_bytes"] = state["size"]
+                self._completed_transfers.add(transfer_id)
+                self._condition.notify_all()
+            self.events.put(
+                ("transfer_complete", {"name": state["name"], "path": str(temporary_path)})
+            )
+            if self._socket:
+                self._socket.sendto(pack_message(ACK, transfer_id, FINAL_ACK_SEQUENCE), address)
             return
 
         destination = self._available_destination(state["name"])
         os.replace(temporary_path, destination)
-        del self._transfers[transfer_id]
+        with self._condition:
+            self._transfers.pop(transfer_id, None)
+            self._completed_transfers.add(transfer_id)
+            self._condition.notify_all()
         self.events.put(("transfer_complete", {"name": state["name"], "path": str(destination)}))
         if self._socket:
             self._socket.sendto(pack_message(ACK, transfer_id, FINAL_ACK_SEQUENCE), address)

@@ -1,2 +1,4 @@
 pygame>=2.5,<3
 mutagen>=1.47,<2
+pywebview>=5,<7
+imageio-ffmpeg>=0.6,<1
