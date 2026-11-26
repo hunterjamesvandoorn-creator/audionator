@@ -199,7 +199,7 @@ class AudioReceiver:
     @staticmethod
     def _snapshot(state: dict[str, Any]) -> TransferSnapshot:
         return TransferSnapshot(
-            state["temporary_path"],
+            state.get("final_path") or state["temporary_path"],
             state["size"],
             state["available_bytes"],
             state["buffer_bytes"],
@@ -561,14 +561,29 @@ class AudioReceiver:
             return
 
         destination = self._available_destination(state["name"])
-        os.replace(temporary_path, destination)
         with self._condition:
-            self._transfers.pop(transfer_id, None)
+            self._replace_file(temporary_path, destination)
+            state["final_path"] = destination
+            state["complete"] = True
+            state["available_bytes"] = state["size"]
+            state["received"] = set()
             self._completed_transfers.add(transfer_id)
             self._condition.notify_all()
         self.events.put(("transfer_complete", {"name": state["name"], "path": str(destination)}))
         if self._socket:
             self._socket.sendto(pack_message(ACK, transfer_id, FINAL_ACK_SEQUENCE), address)
+
+    @staticmethod
+    def _replace_file(source: Path, destination: Path) -> None:
+        # A reader may hold the partial file open for a moment, which Windows reports as a sharing error.
+        for attempt in range(20):
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
 
     def _available_destination(self, name: str) -> Path:
         candidate = self.download_directory / name

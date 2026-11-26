@@ -124,6 +124,9 @@ CLIENT_HTML = """<!doctype html>
     .video-placeholder .play-mark { width: 48px; height: 48px; display: grid; place-items: center; border-radius: 50%; background: #d3f36b20; color: var(--accent); font-size: 19px; }
     .video-title { margin: 14px 0 6px; font-size: 17px; line-height: 1.4; overflow-wrap: anywhere; }
     .video-status { color: var(--muted); font-size: 10px; }
+    .video-buffer { display: flex; align-items: center; gap: 9px; margin-top: 7px; color: var(--muted); font-size: 10px; }
+    .video-buffer-bar { flex: 0 0 160px; height: 4px; border-radius: 2px; background: #ffffff1a; overflow: hidden; }
+    .video-buffer-fill { height: 100%; width: 0; background: var(--accent); transition: width .25s; }
     .up-next { overflow: hidden; }
     .up-next .card-head { padding-bottom: 11px; }
     .up-next .media-list { max-height: 550px; padding-top: 0; }
@@ -250,7 +253,7 @@ CLIENT_HTML = """<!doctype html>
               </div>
             </div>
             <div class="section-heading">
-              <div><h2 id="video-title" class="video-title">Pick something from Up next</h2><div id="video-status" class="video-status">Videos stream over reliable UDP from your server.</div></div>
+              <div><h2 id="video-title" class="video-title">Pick something from Up next</h2><div id="video-status" class="video-status">Videos stream over reliable UDP from your server.</div><div id="video-buffer" class="video-buffer"><span id="video-buffer-text">Buffer: —</span><div class="video-buffer-bar"><div id="video-buffer-fill" class="video-buffer-fill"></div></div></div></div>
               <button id="close-video" class="button secondary" style="display:none">Close player</button>
             </div>
           </section>
@@ -587,10 +590,31 @@ CLIENT_HTML = """<!doctype html>
       $("video-placeholder").style.display = "grid";
       $("video-title").textContent = "Pick something from Up next";
       $("video-status").textContent = "Videos stream over reliable UDP from your server.";
+      updateBufferIndicator();
       await apiReady;
       try { await window.pywebview.api.close_video(); }
       catch (error) { showStatus(`Could not close the video: ${error.message || error}`, true); }
     });
+    function updateBufferIndicator() {
+      const player = $("video-player");
+      const duration = player.duration;
+      let bufferedEnd = 0;
+      let ahead = 0;
+      for (let i = 0; i < player.buffered.length; i++) {
+        const start = player.buffered.start(i);
+        const end = player.buffered.end(i);
+        if (start <= player.currentTime && player.currentTime <= end) {
+          bufferedEnd = end;
+          ahead = end - player.currentTime;
+        }
+      }
+      const hasDuration = Number.isFinite(duration) && duration > 0;
+      $("video-buffer-text").textContent = player.currentSrc ? `Buffered ${ahead.toFixed(0)} s ahead` : "Buffer: —";
+      $("video-buffer-fill").style.width = player.currentSrc && hasDuration ? `${Math.min(100, 100 * bufferedEnd / duration).toFixed(1)}%` : "0%";
+    }
+    for (const eventName of ["loadstart", "progress", "timeupdate", "seeked", "emptied", "durationchange", "loadedmetadata"]) {
+      $("video-player").addEventListener(eventName, updateBufferIndicator);
+    }
     window.addEventListener("load", async () => {
       const bars = [18, 30, 42, 26, 50, 34, 22, 46, 28, 38, 17, 32, 24];
       bars.forEach((height, index) => {

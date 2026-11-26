@@ -19,11 +19,13 @@ import webview
 from mutagen import MutagenError
 from mutagen.mp3 import MP3
 
+from audio_stream import StreamingAudioFile
 from receiver import AudioReceiver
 from video_stream import ProgressiveVideoHTTPServer
 
 RESUME_END_MARGIN_SECONDS = 5.0
 POSITION_SAVE_INTERVAL_SECONDS = 5.0
+AUDIO_START_BUFFER_BYTES = 256 * 1024
 
 
 def _format_time(seconds: float) -> str:
@@ -92,6 +94,11 @@ class AudionatorAPI:
         self.current_track_key: str | None = None
         self._last_position_save = 0.0
         self._lost_connection = False
+        self.streaming_transfer_id: str | None = None
+        self._stream_attempt_id: str | None = None
+        self._stream_file: StreamingAudioFile | None = None
+        self._stream_size = 0
+        self._stream_probe: tuple[str, float] | None = None
 
     def connect(self, host: str, port: int) -> dict[str, Any]:
         try:
@@ -229,6 +236,10 @@ class AudionatorAPI:
         if not self.current_path or self.track_duration <= 0:
             return {"ok": False}
         position = min(max(float(position), 0.0), self.track_duration)
+        if self.streaming_transfer_id and not self._has_downloaded_through(
+            bytes.fromhex(self.streaming_transfer_id), position, self.track_duration, self._stream_size
+        ):
+            return self._failure("That part of the track is still downloading.")
         try:
             if self.playback_finished:
                 pygame.mixer.music.play(start=position)
@@ -279,12 +290,13 @@ class AudionatorAPI:
                 "No server response. Check the IP and port, then make sure the server is running.",
                 is_error=True,
             )
+        self._maybe_start_stream()
         self._update_audio_state()
         active = bool(self.active_transfer_id)
-        if active and self.active_transfer_type == "audio":
+        if active and self.active_transfer_type == "audio" and not self.streaming_transfer_id:
             subtitle = f"Receiving {self.active_transfer_name}… {self.transfer_percent:.0f}%"
         elif self.current_path and not self.is_paused:
-            subtitle = "Now playing"
+            subtitle = f"Streaming · {self.transfer_percent:.0f}% downloaded" if active else "Now playing"
         elif self.current_path and self.is_paused:
             subtitle = "Paused"
         else:
@@ -391,10 +403,15 @@ class AudionatorAPI:
                 self.transfer_percent = 100 if total == 0 else 100 * payload["received"] / total
         elif event == "transfer_complete":
             if self.active_transfer_type == "audio":
+                streamed = self.streaming_transfer_id is not None
                 self.active_transfer_id = None
-                self._play_file(Path(payload["path"]), payload["name"])
+                if streamed:
+                    self._finish_stream(Path(payload["path"]))
+                else:
+                    self._play_file(Path(payload["path"]), payload["name"])
         elif event == "error":
             self.active_transfer_id = None
+            self.streaming_transfer_id = None
             if self.connection_deadline is not None or not self.receiver.is_running:
                 self.connection_deadline = None
                 self.connected = False
@@ -415,12 +432,7 @@ class AudionatorAPI:
 
     def _play_file(self, path: Path, track_name: str) -> None:
         self._remember_position()
-        try:
-            duration = float(MP3(path).info.length)
-            if not math.isfinite(duration) or duration <= 0:
-                duration = 0
-        except (OSError, MutagenError, TypeError, ValueError):
-            duration = 0
+        duration = self._probe_duration(path)
         resume_at = self._resume_position(track_name, duration)
         try:
             if not pygame.mixer.get_init():
@@ -450,6 +462,73 @@ class AudionatorAPI:
             self._set_message(f"Now playing {path.name} from {_format_time(resume_at)}.")
         else:
             self._set_message(f"Now playing {path.name}.")
+
+    @staticmethod
+    def _probe_duration(path: Path) -> float:
+        try:
+            duration = float(MP3(path).info.length)
+        except (OSError, MutagenError, TypeError, ValueError):
+            return 0.0
+        return duration if math.isfinite(duration) and duration > 0 else 0.0
+
+    @staticmethod
+    def _byte_offset(position: float, duration: float, size: int) -> int:
+        if duration <= 0 or size <= 0:
+            return 0
+        return min(size, int(size * position / duration))
+
+    def _has_downloaded_through(self, transfer_id: bytes, position: float, duration: float, size: int) -> bool:
+        needed = min(size, self._byte_offset(position, duration, size) + AUDIO_START_BUFFER_BYTES)
+        return self.receiver.wait_for_transfer_bytes(transfer_id, needed, timeout=0) is not None
+
+    def _maybe_start_stream(self) -> None:
+        transfer_id = self.active_transfer_id
+        if not transfer_id or self.active_transfer_type != "audio" or transfer_id == self._stream_attempt_id:
+            return
+        tid = bytes.fromhex(transfer_id)
+        snapshot = self.receiver.wait_for_transfer_bytes(tid, AUDIO_START_BUFFER_BYTES, timeout=0)
+        if snapshot is None or snapshot.error or snapshot.path is None:
+            return
+        if self._stream_probe is None or self._stream_probe[0] != transfer_id:
+            self._stream_probe = (transfer_id, self._probe_duration(snapshot.path))
+        duration = self._stream_probe[1]
+        name = self.active_transfer_name
+        resume_at = self._resume_position(name, duration)
+        if resume_at > 0 and not self._has_downloaded_through(tid, resume_at, duration, snapshot.size):
+            return
+
+        self._stream_attempt_id = transfer_id
+        self._remember_position()
+        stream = StreamingAudioFile(self.receiver, tid, snapshot.size)
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            pygame.mixer.music.load(stream, name)
+            pygame.mixer.music.play(start=resume_at)
+        except pygame.error as error:
+            self._set_message(f"Could not start streaming {name}: {error}", is_error=True)
+            return
+        self.streaming_transfer_id = transfer_id
+        self._stream_file = stream
+        self._stream_size = snapshot.size
+        self.current_path = snapshot.path
+        self.current_name = name
+        self.current_track_key = name
+        self.track_duration = duration
+        self.playback_offset = resume_at
+        self.playback_started_at = time.monotonic()
+        self._last_position_save = self.playback_started_at
+        self.playback_finished = False
+        self.is_paused = False
+        self._set_message(f"Streaming {name} while it downloads.")
+
+    def _finish_stream(self, path: Path) -> None:
+        # The download is complete: point the player at the final file and use its exact duration.
+        self.streaming_transfer_id = None
+        self.current_path = path
+        duration = self._probe_duration(path)
+        if duration > 0:
+            self.track_duration = duration
 
     def _update_audio_state(self) -> None:
         if not self.current_path or self.is_paused or self.playback_finished:
