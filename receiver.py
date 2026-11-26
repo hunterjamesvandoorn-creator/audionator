@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import os
 import queue
 import socket
 import threading
 import time
 import uuid
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,14 +16,25 @@ from typing import Any
 from udp_protocol import (
     ACK,
     CONTROL,
+    CONTROL_ACK,
+    CONTROL_MAX_RETRIES,
+    CONTROL_RETRY_INTERVAL,
     DATA,
     FINAL_ACK_SEQUENCE,
     FIN,
+    HEARTBEAT,
+    HEARTBEAT_ACK,
+    HEARTBEAT_INTERVAL,
+    HEARTBEAT_TIMEOUT,
     decode_control,
     encode_control,
     pack_message,
     unpack_message,
 )
+
+
+CONTROL_HISTORY_SIZE = 1024
+LATENCY_WINDOW_SIZE = 60
 
 
 @dataclass(frozen=True)
@@ -32,6 +45,15 @@ class TransferSnapshot:
     buffer_bytes: int
     complete: bool
     error: str | None
+
+
+@dataclass
+class _PendingControl:
+    packet: bytes
+    transfer_id: bytes
+    failure_message: str
+    sent_at: float
+    retries: int
 
 
 class AudioReceiver:
@@ -46,10 +68,38 @@ class AudioReceiver:
         self._transfer_errors: dict[bytes, str] = {}
         self._completed_transfers: set[bytes] = set()
         self._condition = threading.Condition()
+        self._control_lock = threading.Lock()
+        self._control_ids = itertools.count(1)
+        self._pending_controls: dict[int, _PendingControl] = {}
+        self._seen_controls: OrderedDict[int, None] = OrderedDict()
+        self._heartbeat_sequence = 0
+        self._last_heartbeat_sent = float("-inf")
+        self._last_heartbeat_reply = 0.0
+        self._connection_lost = False
+        self._heartbeat_sent_at: dict[int, float] = {}
+        self._latency_samples: deque[float] = deque(maxlen=LATENCY_WINDOW_SIZE)
+        self._latency_lock = threading.Lock()
+        self._loss_missed = 0
+        self._loss_packets = 0
 
     @property
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
+
+    def latency_summary(self) -> dict[str, Any]:
+        with self._latency_lock:
+            samples = list(self._latency_samples)
+        if not samples:
+            return {"average_ms": None, "max_ms": None, "samples": 0}
+        return {
+            "average_ms": round(sum(samples) / len(samples), 1),
+            "max_ms": round(max(samples), 1),
+            "samples": len(samples),
+        }
+
+    def loss_counts(self) -> tuple[int, int]:
+        with self._condition:
+            return self._loss_missed, self._loss_packets
 
     def connect(self, host: str, port: int) -> None:
         if self.is_running:
@@ -62,20 +112,48 @@ class AudioReceiver:
         sock.settimeout(0.2)
         self._socket = sock
         self._server_address = (address[0], address[1])
+        with self._control_lock:
+            self._pending_controls.clear()
+            self._seen_controls.clear()
+        self._heartbeat_sequence = 0
+        self._last_heartbeat_sent = float("-inf")
+        self._last_heartbeat_reply = time.monotonic()
+        self._connection_lost = False
+        self._heartbeat_sent_at.clear()
+        with self._latency_lock:
+            self._latency_samples.clear()
+        with self._condition:
+            self._loss_missed = 0
+            self._loss_packets = 0
         self._stop.clear()
         self._thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._thread.start()
-        self.request_library()
-        self.events.put(("status", {"message": f"Connected to {address[0]}:{port}"}))
+        self._send_control({"command": "CONNECT"}, failure_message="Server did not accept the connection.")
 
     def request_library(self) -> None:
-        self._send_control({"command": "LIST"})
+        self._send_control({"command": "LIST"}, failure_message="Server did not return its library.")
+
+    def create_session(self) -> None:
+        self._send_control({"command": "CREATE_SESSION"}, failure_message="Server could not create a session.")
+
+    def join_session(self, code: str) -> None:
+        self._send_control(
+            {"command": "JOIN_SESSION", "code": code},
+            failure_message="Server did not respond to the join request.",
+        )
+
+    def leave_session(self) -> None:
+        self._send_control({"command": "LEAVE_SESSION"}, failure_message="Server did not confirm leaving the session.")
 
     def request_file(self, name: str) -> bytes:
         if not self._thread or not self._thread.is_alive():
             raise RuntimeError("Connect to an audio server first.")
         transfer_id = uuid.uuid4().bytes
-        self._send_control({"command": "GET", "name": name}, transfer_id)
+        self._send_control(
+            {"command": "GET", "name": name},
+            transfer_id,
+            failure_message=f"Server did not respond to the request for {name}.",
+        )
         return transfer_id
 
     def wait_for_transfer_bytes(
@@ -149,12 +227,88 @@ class AudioReceiver:
                 temporary_path.unlink(missing_ok=True)
         self._transfer_errors.clear()
         self._completed_transfers.clear()
+        with self._control_lock:
+            self._pending_controls.clear()
 
-    def _send_control(self, message: dict[str, Any], transfer_id: bytes = bytes(16)) -> None:
-        if not self._socket or not self._server_address:
+    def _send_control(
+        self,
+        message: dict[str, Any],
+        transfer_id: bytes = bytes(16),
+        failure_message: str = "Server did not respond.",
+    ) -> None:
+        sock = self._socket
+        if not sock or not self._server_address:
             raise RuntimeError("Connect to an audio server first.")
-        packet = pack_message(CONTROL, transfer_id, payload=encode_control(message))
-        self._socket.sendto(packet, self._server_address)
+        with self._control_lock:
+            control_id = next(self._control_ids)
+            packet = pack_message(CONTROL, transfer_id, control_id, encode_control(message))
+            self._pending_controls[control_id] = _PendingControl(
+                packet,
+                transfer_id,
+                failure_message,
+                time.monotonic(),
+                0,
+            )
+        sock.sendto(packet, self._server_address)
+
+    def _retransmit_controls(self) -> None:
+        sock = self._socket
+        if sock is None or not self._server_address:
+            return
+        now = time.monotonic()
+        resend: list[bytes] = []
+        failed: list[_PendingControl] = []
+        with self._control_lock:
+            for control_id, pending in list(self._pending_controls.items()):
+                if now - pending.sent_at < CONTROL_RETRY_INTERVAL:
+                    continue
+                if pending.retries >= CONTROL_MAX_RETRIES:
+                    del self._pending_controls[control_id]
+                    failed.append(pending)
+                    continue
+                pending.retries += 1
+                pending.sent_at = now
+                resend.append(pending.packet)
+        for packet in resend:
+            sock.sendto(packet, self._server_address)
+        for pending in failed:
+            self._control_failed(pending)
+
+    def _service_heartbeat(self) -> None:
+        sock = self._socket
+        if sock is None or not self._server_address:
+            return
+        now = time.monotonic()
+        if now - self._last_heartbeat_sent >= HEARTBEAT_INTERVAL:
+            self._last_heartbeat_sent = now
+            self._heartbeat_sequence += 1
+            self._heartbeat_sent_at = {
+                sequence: sent_at
+                for sequence, sent_at in self._heartbeat_sent_at.items()
+                if now - sent_at <= HEARTBEAT_TIMEOUT
+            }
+            self._heartbeat_sent_at[self._heartbeat_sequence] = now
+            sock.sendto(
+                pack_message(HEARTBEAT, sequence=self._heartbeat_sequence),
+                self._server_address,
+            )
+        if not self._connection_lost and now - self._last_heartbeat_reply > HEARTBEAT_TIMEOUT:
+            self._connection_lost = True
+            self.events.put(("connection_lost", {"message": "Lost contact with the server."}))
+
+    def _control_failed(self, pending: _PendingControl) -> None:
+        if pending.transfer_id != bytes(16):
+            self._discard_transfer(pending.transfer_id, pending.failure_message)
+        self.events.put(("error", {"message": pending.failure_message}))
+
+    def _remember_control(self, control_id: int) -> bool:
+        with self._control_lock:
+            if control_id in self._seen_controls:
+                return False
+            self._seen_controls[control_id] = None
+            if len(self._seen_controls) > CONTROL_HISTORY_SIZE:
+                self._seen_controls.popitem(last=False)
+            return True
 
     def _receive_loop(self) -> None:
         while not self._stop.is_set():
@@ -162,9 +316,14 @@ class AudioReceiver:
             if sock is None:
                 return
             try:
+                self._retransmit_controls()
+                self._service_heartbeat()
                 packet, address = sock.recvfrom(2048)
                 self._handle_packet(packet, address)
             except socket.timeout:
+                continue
+            except ConnectionResetError:
+                # Windows reports ICMP port-unreachable as a reset; the heartbeat timeout detects real loss.
                 continue
             except OSError as error:
                 if not self._stop.is_set():
@@ -174,18 +333,43 @@ class AudioReceiver:
                 self.events.put(("error", {"message": f"Invalid server response: {error}"}))
 
     def _handle_packet(self, packet: bytes, address: tuple[str, int]) -> None:
-        kind, transfer_id, sequence, payload = unpack_message(packet)
+        kind, transfer_id, sequence, _timestamp_us, payload = unpack_message(packet)
         sock = self._socket
         if sock is None:
             return
 
+        if kind == CONTROL_ACK:
+            with self._control_lock:
+                self._pending_controls.pop(sequence, None)
+            return
+        if kind == HEARTBEAT_ACK:
+            now = time.monotonic()
+            self._last_heartbeat_reply = now
+            sent_at = self._heartbeat_sent_at.pop(sequence, None)
+            if sent_at is not None:
+                with self._latency_lock:
+                    self._latency_samples.append((now - sent_at) * 1000)
+            if self._connection_lost:
+                self._connection_lost = False
+                self.events.put(("connection_restored", {"message": "Connection to the server restored."}))
+            return
         if kind == CONTROL:
             message = decode_control(payload)
+            sock.sendto(pack_message(CONTROL_ACK, transfer_id, sequence), address)
+            if not self._remember_control(sequence):
+                return
             response_type = message.get("type")
-            if response_type == "LIST":
+            if response_type == "ACCEPT":
+                self.events.put(("accepted", {}))
+                self.request_library()
+            elif response_type == "LIST":
                 self.events.put(("library", {"files": message.get("files", [])}))
             elif response_type == "START":
                 self._start_transfer(transfer_id, message)
+            elif response_type == "SESSION":
+                self.events.put(("session", {"code": message["code"], "members": message["members"]}))
+            elif response_type == "LEFT":
+                self.events.put(("left", {}))
             elif response_type == "ERROR":
                 error = str(message.get("message", "Server error"))
                 self._discard_transfer(transfer_id, error)
@@ -248,6 +432,7 @@ class AudioReceiver:
             "buffer_bytes": buffer_bytes,
             "sha256": digest,
             "received": set(),
+            "highest_sequence": -1,
             "next_contiguous_chunk": 0,
             "available_bytes": 0,
             "stream": stream,
@@ -295,6 +480,11 @@ class AudioReceiver:
             stream.write(payload)
             stream.flush()
             state["received"].add(sequence)
+            # A gap is counted once, when a later sequence first arrives past it.
+            if sequence > state["highest_sequence"]:
+                self._loss_packets += sequence - state["highest_sequence"]
+                self._loss_missed += sequence - state["highest_sequence"] - 1
+                state["highest_sequence"] = sequence
             while state["next_contiguous_chunk"] in state["received"]:
                 state["next_contiguous_chunk"] += 1
             state["available_bytes"] = min(

@@ -280,6 +280,16 @@ CLIENT_HTML = """<!doctype html>
           <div class="connection-status"><span id="connection-status-dot" class="connection-dot" aria-hidden="true"></span><span id="connection-status-text">Not connected</span></div>
           <div id="status-line" class="status-line">Connect to browse the shared library.</div>
         </section>
+        <section class="card connect-card">
+          <div class="eyebrow">LISTENING SESSION</div>
+          <p id="session-summary" class="help-text">Not in a session. Create one, or join with a code from the host.</p>
+          <div class="connect-fields">
+            <div class="field host"><label for="session-code">SESSION CODE</label><input id="session-code" type="text" maxlength="8" placeholder="Example: K7QM" autocomplete="off"></div>
+            <button id="join-session-button" class="button secondary" disabled>Join</button>
+            <button id="create-session-button" class="button primary" disabled>New session</button>
+            <button id="leave-session-button" class="button secondary" style="display: none">Leave</button>
+          </div>
+        </section>
       </section>
 
       <section id="page-settings" class="page">
@@ -475,11 +485,20 @@ CLIENT_HTML = """<!doctype html>
           indicator.classList.toggle("connecting", current.connecting);
           indicator.setAttribute("aria-label", current.connected ? "Connected" : current.connecting ? "Connecting" : "Disconnected");
         }
+        const ping = current.latency.average_ms === null ? "" : ` · Ping ${current.latency.average_ms} ms avg, ${current.latency.max_ms} ms max`;
+        const loss = current.loss.percent === null ? "" : ` · Loss ${current.loss.percent}%`;
         $("connection-status-text").textContent = current.connected
-          ? `Connected to ${current.server.host}:${current.server.port}`
+          ? `Connected to ${current.server.host}:${current.server.port}${ping}${loss}`
           : current.connecting ? "Contacting server…" : current.message;
         $("connect-button").disabled = current.connecting;
         $("connect-button").textContent = current.connecting ? "Connecting…" : current.connected ? "Refresh library" : "Connect";
+        const session = current.session;
+        $("session-summary").textContent = session.code
+          ? `In session ${session.code} · ${session.members} listening`
+          : "Not in a session. Create one, or join with a code from the host.";
+        $("leave-session-button").style.display = session.code ? "" : "none";
+        $("create-session-button").disabled = !current.connected;
+        $("join-session-button").disabled = !current.connected;
         $("audio-search").disabled = !current.connected;
         $("video-search").disabled = !current.connected;
         $("music-count").textContent = current.connected ? String(current.files.audio.length) : "—";
@@ -520,6 +539,19 @@ CLIENT_HTML = """<!doctype html>
     document.querySelectorAll("[data-open-connect]").forEach(button => button.addEventListener("click", () => navigate("connect")));
     $("connect-button").addEventListener("click", connect);
     $("server-host").addEventListener("keydown", event => { if (event.key === "Enter") connect(); });
+    async function sessionAction(request) {
+      await apiReady;
+      try {
+        const result = await request();
+        if (!result.ok) showStatus(result.message, true);
+      } catch (error) {
+        showStatus(`Session request failed: ${error.message || error}`, true);
+      }
+    }
+    $("create-session-button").addEventListener("click", () => sessionAction(() => window.pywebview.api.create_session()));
+    $("join-session-button").addEventListener("click", () => sessionAction(() => window.pywebview.api.join_session($("session-code").value)));
+    $("session-code").addEventListener("keydown", event => { if (event.key === "Enter") sessionAction(() => window.pywebview.api.join_session($("session-code").value)); });
+    $("leave-session-button").addEventListener("click", () => sessionAction(() => window.pywebview.api.leave_session()));
     $("server-port").addEventListener("keydown", event => { if (event.key === "Enter") connect(); });
     $("audio-search").addEventListener("input", () => renderList("audio"));
     $("video-search").addEventListener("input", () => renderList("video"));

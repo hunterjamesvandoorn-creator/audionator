@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 from tkinter import messagebox
 from typing import Any
@@ -20,6 +21,14 @@ from mutagen.mp3 import MP3
 
 from receiver import AudioReceiver
 from video_stream import ProgressiveVideoHTTPServer
+
+RESUME_END_MARGIN_SECONDS = 5.0
+POSITION_SAVE_INTERVAL_SECONDS = 5.0
+
+
+def _format_time(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}:{secs:02d}"
 
 
 class AudionatorAPI:
@@ -36,6 +45,7 @@ class AudionatorAPI:
         self.settings_path = settings_path or local_app_data / "Audionator" / "settings.json"
         self.saved_host = ""
         self.saved_port = 5005
+        self.playback_positions: dict[str, float] = {}
         try:
             if self.settings_path.exists():
                 settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -47,6 +57,14 @@ class AudionatorAPI:
                     raise ValueError("Saved server address or port is invalid.")
                 self.saved_host = host
                 self.saved_port = port
+                positions = settings.get("playback_positions", {})
+                if not isinstance(positions, dict):
+                    raise ValueError("Saved playback positions must be a JSON object.")
+                self.playback_positions = {
+                    name: float(seconds)
+                    for name, seconds in positions.items()
+                    if type(seconds) in (int, float) and math.isfinite(seconds) and seconds > 0
+                }
         except (OSError, ValueError) as error:
             self._set_message(f"Could not load saved connection settings: {error}", is_error=True)
         self.video_receiver: AudioReceiver | None = None
@@ -57,6 +75,8 @@ class AudionatorAPI:
         self.message = "Connect to browse the shared library."
         self.error = False
         self.connection_warning: str | None = None
+        self.session_code: str | None = None
+        self.session_members = 0
         self.active_transfer_id: str | None = None
         self.active_transfer_type: str | None = None
         self.active_transfer_name = ""
@@ -69,6 +89,9 @@ class AudionatorAPI:
         self.playback_started_at: float | None = None
         self.is_paused = True
         self.playback_finished = False
+        self.current_track_key: str | None = None
+        self._last_position_save = 0.0
+        self._lost_connection = False
 
     def connect(self, host: str, port: int) -> dict[str, Any]:
         try:
@@ -78,7 +101,7 @@ class AudionatorAPI:
             if not 1 <= port <= 65535:
                 raise ValueError("Port must be between 1 and 65535.")
             server = (host, port)
-            if self.receiver.is_running and server == self.connected_server:
+            if self.connected and self.receiver.is_running and server == self.connected_server:
                 self.receiver.request_library()
             else:
                 self.close_video()
@@ -87,11 +110,14 @@ class AudionatorAPI:
                 self.receiver = AudioReceiver(self.download_directory)
                 self.receiver.connect(host, port)
                 self.connected_server = server
+                self.session_code = None
+                self.session_members = 0
+                self.connected = False
+                self._lost_connection = False
+                self.connection_deadline = time.monotonic() + 8
             self.saved_host = host
             self.saved_port = port
-            self.connected = False
-            self.connection_deadline = time.monotonic() + 8
-            self.connection_warning = self._save_connection()
+            self.connection_warning = self._save_settings()
             self.error = self.connection_warning is not None
             self.message = self.connection_warning or "Contacting the server…"
             return {"ok": True, "warning": self.connection_warning}
@@ -101,6 +127,27 @@ class AudionatorAPI:
 
     def get_saved_connection(self) -> dict[str, Any]:
         return {"host": self.saved_host, "port": self.saved_port}
+
+    def create_session(self) -> dict[str, Any]:
+        return self._session_request(self.receiver.create_session)
+
+    def join_session(self, code: str) -> dict[str, Any]:
+        code = code.strip().upper()
+        if not code:
+            return self._failure("Enter the session code.")
+        return self._session_request(lambda: self.receiver.join_session(code))
+
+    def leave_session(self) -> dict[str, Any]:
+        return self._session_request(self.receiver.leave_session)
+
+    def _session_request(self, request: Callable[[], None]) -> dict[str, Any]:
+        if not self.connected or not self.receiver.is_running:
+            return self._failure("Connect to a server before using sessions.")
+        try:
+            request()
+        except (OSError, RuntimeError, ValueError) as error:
+            return self._failure(str(error))
+        return {"ok": True}
 
     def receive_audio(self, name: str) -> dict[str, Any]:
         if not self.connected or not self.receiver.is_running:
@@ -128,6 +175,7 @@ class AudionatorAPI:
             pygame.mixer.music.pause()
             self.playback_started_at = None
             self.is_paused = True
+            self._remember_position()
         self.close_video()
         receiver = AudioReceiver(self.download_directory)
         try:
@@ -171,6 +219,7 @@ class AudionatorAPI:
                 pygame.mixer.music.pause()
                 self.playback_started_at = None
                 self.is_paused = True
+                self._remember_position()
             return {"ok": True}
         except pygame.error as error:
             self._set_message(f"Playback control failed: {error}", is_error=True)
@@ -191,6 +240,7 @@ class AudionatorAPI:
                 if not self.is_paused:
                     self.playback_started_at = time.monotonic()
             self.playback_offset = position
+            self._remember_position()
             return {"ok": True}
         except pygame.error as error:
             self._set_message(f"Could not seek to that position: {error}", is_error=True)
@@ -205,6 +255,17 @@ class AudionatorAPI:
             message = f"Could not open the received music folder: {error}"
             self._set_message(message, is_error=True)
             return {"ok": False, "message": message}
+
+    def _packet_loss(self) -> dict[str, Any]:
+        receivers = [self.receiver] + ([self.video_receiver] if self.video_receiver else [])
+        counts = [receiver.loss_counts() for receiver in receivers]
+        missed = sum(count[0] for count in counts)
+        packets = sum(count[1] for count in counts)
+        return {
+            "percent": round(100 * missed / packets, 1) if packets else None,
+            "missed": missed,
+            "packets": packets,
+        }
 
     def get_state(self) -> dict[str, Any]:
         self._process_receiver_events(self.receiver, is_video=False)
@@ -239,6 +300,8 @@ class AudionatorAPI:
                 "port": self.connected_server[1] if self.connected_server else 5005,
             },
             "download_directory": str(self.download_directory),
+            "latency": self.receiver.latency_summary(),
+            "loss": self._packet_loss(),
             "audio": {
                 "name": self.current_name or self.active_transfer_name,
                 "subtitle": subtitle,
@@ -249,9 +312,11 @@ class AudionatorAPI:
                 "duration": self.track_duration,
             },
             "video": {"status": self.video_status, "active": self.video_receiver is not None},
+            "session": {"code": self.session_code if self.connected else None, "members": self.session_members},
         }
 
     def shutdown(self) -> None:
+        self._remember_position()
         self.close_video()
         self.receiver.close()
         if pygame.mixer.get_init():
@@ -270,10 +335,11 @@ class AudionatorAPI:
             return
 
     def _handle_event(self, event: str, payload: dict[str, Any]) -> None:
-        if event == "library":
+        if event == "accepted":
             self.connection_deadline = None
             self.connected = True
             self.error = False
+        elif event == "library":
             files: dict[str, list[dict[str, Any]]] = {"audio": [], "video": []}
             for item in payload.get("files", []):
                 if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -292,9 +358,29 @@ class AudionatorAPI:
             if self.connection_warning:
                 message = f"{message} {self.connection_warning}"
             self._set_message(message, is_error=self.connection_warning is not None)
+        elif event == "session":
+            self.session_code = str(payload["code"])
+            self.session_members = int(payload["members"])
+            self._set_message(f"In session {self.session_code}. Share this code so others can join.")
+        elif event == "left":
+            self.session_code = None
+            self.session_members = 0
+            self._set_message("Left the session.")
         elif event == "status":
             if not self.connected:
                 self.message = payload["message"]
+        elif event == "connection_lost":
+            if self.connected:
+                self.connected = False
+                self.session_code = None
+                self.session_members = 0
+                self._lost_connection = True
+                self._set_message(payload["message"], is_error=True)
+        elif event == "connection_restored":
+            if self._lost_connection:
+                self._lost_connection = False
+                self.connected = True
+                self._set_message(payload["message"])
         elif event == "transfer_started":
             self.active_transfer_id = payload["id"]
             self.active_transfer_name = payload["name"]
@@ -306,7 +392,7 @@ class AudionatorAPI:
         elif event == "transfer_complete":
             if self.active_transfer_type == "audio":
                 self.active_transfer_id = None
-                self._play_file(Path(payload["path"]))
+                self._play_file(Path(payload["path"]), payload["name"])
         elif event == "error":
             self.active_transfer_id = None
             if self.connection_deadline is not None or not self.receiver.is_running:
@@ -327,21 +413,24 @@ class AudionatorAPI:
             self.video_status = payload["message"]
             self._set_message(payload["message"], is_error=True)
 
-    def _play_file(self, path: Path) -> None:
+    def _play_file(self, path: Path, track_name: str) -> None:
+        self._remember_position()
         try:
             duration = float(MP3(path).info.length)
             if not math.isfinite(duration) or duration <= 0:
                 duration = 0
         except (OSError, MutagenError, TypeError, ValueError):
             duration = 0
+        resume_at = self._resume_position(track_name, duration)
         try:
             if not pygame.mixer.get_init():
                 pygame.mixer.init()
             pygame.mixer.music.load(str(path))
-            pygame.mixer.music.play()
+            pygame.mixer.music.play(start=resume_at)
         except pygame.error as error:
             self.current_path = path
             self.current_name = path.name
+            self.current_track_key = None
             self.track_duration = duration
             self.playback_offset = 0.0
             self.playback_started_at = None
@@ -350,12 +439,17 @@ class AudionatorAPI:
             return
         self.current_path = path
         self.current_name = path.name
+        self.current_track_key = track_name
         self.track_duration = duration
-        self.playback_offset = 0.0
+        self.playback_offset = resume_at
         self.playback_started_at = time.monotonic()
+        self._last_position_save = self.playback_started_at
         self.playback_finished = False
         self.is_paused = False
-        self._set_message(f"Now playing {path.name}.")
+        if resume_at > 0:
+            self._set_message(f"Now playing {path.name} from {_format_time(resume_at)}.")
+        else:
+            self._set_message(f"Now playing {path.name}.")
 
     def _update_audio_state(self) -> None:
         if not self.current_path or self.is_paused or self.playback_finished:
@@ -366,6 +460,9 @@ class AudionatorAPI:
                 self.playback_started_at = None
                 self.playback_finished = True
                 self.is_paused = True
+                self._remember_position()
+            elif time.monotonic() - self._last_position_save >= POSITION_SAVE_INTERVAL_SECONDS:
+                self._remember_position()
         except pygame.error as error:
             self._set_message(f"Audio output error: {error}", is_error=True)
 
@@ -379,16 +476,42 @@ class AudionatorAPI:
         self.message = message
         self.error = is_error
 
-    def _save_connection(self) -> str | None:
+    def _save_settings(self) -> str | None:
         try:
             self.settings_path.parent.mkdir(parents=True, exist_ok=True)
             self.settings_path.write_text(
-                json.dumps({"host": self.saved_host, "port": self.saved_port}),
+                json.dumps(
+                    {
+                        "host": self.saved_host,
+                        "port": self.saved_port,
+                        "playback_positions": self.playback_positions,
+                    }
+                ),
                 encoding="utf-8",
             )
             return None
         except OSError as error:
-            return f"Couldn't save the server address: {error}"
+            return f"Couldn't save settings: {error}"
+
+    def _remember_position(self) -> None:
+        if not self.current_track_key or self.track_duration <= 0:
+            return
+        position = self._current_position()
+        remaining = self.track_duration - position
+        if self.playback_finished or position < 1 or remaining < RESUME_END_MARGIN_SECONDS:
+            self.playback_positions.pop(self.current_track_key, None)
+        else:
+            self.playback_positions[self.current_track_key] = position
+        self._last_position_save = time.monotonic()
+        error = self._save_settings()
+        if error:
+            self._set_message(error, is_error=True)
+
+    def _resume_position(self, track_name: str, duration: float) -> float:
+        position = self.playback_positions.get(track_name, 0.0)
+        if duration <= 0 or position < 1 or duration - position < RESUME_END_MARGIN_SECONDS:
+            return 0.0
+        return position
 
     def _failure(self, message: str) -> dict[str, Any]:
         self._set_message(message, is_error=True)

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import queue
+import secrets
 import socket
 import socketserver
 import threading
 import time
+from collections import OrderedDict
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,9 +20,15 @@ from udp_protocol import (
     ACK,
     CHUNK_SIZE,
     CONTROL,
+    CONTROL_ACK,
+    CONTROL_MAX_RETRIES,
+    CONTROL_RETRY_INTERVAL,
     DATA,
     FINAL_ACK_SEQUENCE,
     FIN,
+    HEARTBEAT,
+    HEARTBEAT_ACK,
+    HEARTBEAT_TIMEOUT,
     WINDOW_SIZE,
     decode_control,
     encode_control,
@@ -33,6 +42,73 @@ TRANSFER_TIMEOUT = 30.0
 RETRY_INTERVAL = 0.35
 MAX_RETRIES = 30
 VIDEO_START_BUFFER_BYTES = 2 * 1024 * 1024
+CONTROL_HISTORY_SIZE = 1024
+SESSION_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+SESSION_CODE_LENGTH = 4
+
+
+class SessionRegistry:
+    def __init__(self, timeout: float = HEARTBEAT_TIMEOUT) -> None:
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._members: dict[str, dict[tuple[str, int], float]] = {}
+        self._session_of: dict[tuple[str, int], str] = {}
+
+    def create(self, client: tuple[str, int], now: float) -> tuple[str, int]:
+        with self._lock:
+            self._prune(now)
+            self._leave(client)
+            code = self._new_code()
+            self._members[code] = {}
+            self._join(client, code, now)
+            return code, 1
+
+    def join(self, client: tuple[str, int], code: Any, now: float) -> tuple[str, int] | None:
+        if not isinstance(code, str):
+            return None
+        code = code.strip().upper()
+        with self._lock:
+            self._prune(now)
+            if code not in self._members:
+                return None
+            self._leave(client)
+            self._join(client, code, now)
+            return code, len(self._members[code])
+
+    def leave(self, client: tuple[str, int], now: float) -> None:
+        with self._lock:
+            self._prune(now)
+            self._leave(client)
+
+    def touch(self, client: tuple[str, int], now: float) -> None:
+        with self._lock:
+            code = self._session_of.get(client)
+            if code is not None:
+                self._members[code][client] = now
+
+    def _join(self, client: tuple[str, int], code: str, now: float) -> None:
+        self._members[code][client] = now
+        self._session_of[client] = code
+
+    def _leave(self, client: tuple[str, int]) -> None:
+        code = self._session_of.pop(client, None)
+        if code is None:
+            return
+        members = self._members[code]
+        members.pop(client, None)
+        if not members:
+            del self._members[code]
+
+    def _prune(self, now: float) -> None:
+        for client, code in list(self._session_of.items()):
+            if now - self._members[code][client] > self._timeout:
+                self._leave(client)
+
+    def _new_code(self) -> str:
+        while True:
+            code = "".join(secrets.choice(SESSION_CODE_ALPHABET) for _ in range(SESSION_CODE_LENGTH))
+            if code not in self._members:
+                return code
 
 
 class AudioUDPServer(socketserver.ThreadingUDPServer):
@@ -53,6 +129,11 @@ class AudioUDPServer(socketserver.ThreadingUDPServer):
         self.video_service = VideoPreparationService(self.video_library, video_cache_directory)
         self._transfers_lock = threading.Lock()
         self._transfers: dict[bytes, tuple[tuple[str, int], queue.Queue[tuple[int, tuple[str, int]]]]] = {}
+        self._control_lock = threading.Lock()
+        self._control_ids = itertools.count(1)
+        self._control_waiters: dict[tuple[tuple[str, int], int], threading.Event] = {}
+        self._seen_controls: OrderedDict[tuple[tuple[str, int], int], None] = OrderedDict()
+        self.sessions = SessionRegistry()
         super().__init__(address, AudioUDPHandler)
 
     def register_transfer(
@@ -80,6 +161,40 @@ class AudioUDPServer(socketserver.ThreadingUDPServer):
         if transfer and transfer[0] == client_address:
             transfer[1].put((sequence, client_address))
 
+    def next_control_id(self) -> int:
+        with self._control_lock:
+            return next(self._control_ids)
+
+    def expect_control_acknowledgement(
+        self,
+        client_address: tuple[str, int],
+        control_id: int,
+    ) -> threading.Event:
+        acknowledged = threading.Event()
+        with self._control_lock:
+            self._control_waiters[(client_address, control_id)] = acknowledged
+        return acknowledged
+
+    def forget_control_acknowledgement(self, client_address: tuple[str, int], control_id: int) -> None:
+        with self._control_lock:
+            self._control_waiters.pop((client_address, control_id), None)
+
+    def route_control_acknowledgement(self, client_address: tuple[str, int], control_id: int) -> None:
+        with self._control_lock:
+            acknowledged = self._control_waiters.get((client_address, control_id))
+        if acknowledged is not None:
+            acknowledged.set()
+
+    def remember_control(self, client_address: tuple[str, int], control_id: int) -> bool:
+        key = (client_address, control_id)
+        with self._control_lock:
+            if key in self._seen_controls:
+                return False
+            self._seen_controls[key] = None
+            if len(self._seen_controls) > CONTROL_HISTORY_SIZE:
+                self._seen_controls.popitem(last=False)
+            return True
+
 
 class AudioUDPHandler(socketserver.BaseRequestHandler):
     server: AudioUDPServer
@@ -88,17 +203,27 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         packet, _server_socket = self.request
         client_address = self.client_address
         try:
-            kind, transfer_id, sequence, payload = unpack_message(packet)
+            kind, transfer_id, sequence, _timestamp_us, payload = unpack_message(packet)
         except ValueError:
             return
+        self.server.sessions.touch(client_address, time.monotonic())
         if kind == ACK:
             self.server.route_acknowledgement(transfer_id, sequence, client_address)
+            return
+        if kind == CONTROL_ACK:
+            self.server.route_control_acknowledgement(client_address, sequence)
+            return
+        if kind == HEARTBEAT:
+            self.server.socket.sendto(pack_message(HEARTBEAT_ACK, transfer_id, sequence), client_address)
             return
         if kind != CONTROL:
             return
         try:
             message = decode_control(payload)
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        self.server.socket.sendto(pack_message(CONTROL_ACK, transfer_id, sequence), client_address)
+        if not self.server.remember_control(client_address, sequence):
             return
 
         command = message.get("command")
@@ -126,6 +251,21 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                     ),
                 },
             )
+        elif command == "CREATE_SESSION":
+            code, members = self.server.sessions.create(client_address, time.monotonic())
+            self._send_control(client_address, transfer_id, {"type": "SESSION", "code": code, "members": members})
+        elif command == "JOIN_SESSION":
+            joined = self.server.sessions.join(client_address, message.get("code"), time.monotonic())
+            if joined is None:
+                self._send_control(client_address, transfer_id, {"type": "ERROR", "message": "No session has that code."})
+            else:
+                code, members = joined
+                self._send_control(client_address, transfer_id, {"type": "SESSION", "code": code, "members": members})
+        elif command == "LEAVE_SESSION":
+            self.server.sessions.leave(client_address, time.monotonic())
+            self._send_control(client_address, transfer_id, {"type": "LEFT"})
+        elif command == "CONNECT":
+            self._send_control(client_address, transfer_id, {"type": "ACCEPT"})
         elif command == "GET":
             name = message.get("name")
             try:
@@ -170,11 +310,18 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         client_address: tuple[str, int],
         transfer_id: bytes,
         message: dict[str, Any],
-    ) -> None:
-        self.server.socket.sendto(
-            pack_message(CONTROL, transfer_id, payload=encode_control(message)),
-            client_address,
-        )
+    ) -> bool:
+        control_id = self.server.next_control_id()
+        packet = pack_message(CONTROL, transfer_id, control_id, encode_control(message))
+        acknowledged = self.server.expect_control_acknowledgement(client_address, control_id)
+        try:
+            for _ in range(CONTROL_MAX_RETRIES):
+                self.server.socket.sendto(packet, client_address)
+                if acknowledged.wait(CONTROL_RETRY_INTERVAL):
+                    return True
+            return False
+        finally:
+            self.server.forget_control_acknowledgement(client_address, control_id)
 
     def _send_file(
         self,
@@ -209,7 +356,7 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         last_activity = time.monotonic()
 
         try:
-            self._send_control(
+            if not self._send_control(
                 client_address,
                 transfer_id,
                 {
@@ -222,7 +369,8 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                     "media_type": media_type,
                     "buffer_bytes": buffer_bytes,
                 },
-            )
+            ):
+                return
             with path.open("rb") as audio_file:
                 while len(acknowledged) < chunks:
                     while next_sequence < chunks and len(pending) < WINDOW_SIZE:
