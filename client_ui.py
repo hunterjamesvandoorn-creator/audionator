@@ -116,6 +116,10 @@ CLIENT_HTML = """<!doctype html>
     .help-text { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
     .connection-status { display: flex; align-items: center; gap: 9px; margin-top: 18px; padding: 12px; border: 1px solid var(--border); border-radius: 9px; color: var(--muted); font-size: 11px; }
     .connection-status .connection-dot { margin: 0; }
+    .health-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+    .health-metric { padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: #11120f; }
+    .health-label { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .8px; text-transform: uppercase; }
+    .health-value { margin-top: 6px; font-size: 18px; font-weight: 650; letter-spacing: -.4px; }
     .video-layout { display: grid; grid-template-columns: minmax(0, 1fr) 285px; align-items: start; gap: 16px; }
     .video-main, .up-next { min-width: 0; }
     .video-stage { position: relative; overflow: hidden; border: 1px solid var(--border); border-radius: 13px; background: #050605; aspect-ratio: 16 / 9; }
@@ -124,9 +128,25 @@ CLIENT_HTML = """<!doctype html>
     .video-placeholder .play-mark { width: 48px; height: 48px; display: grid; place-items: center; border-radius: 50%; background: #d3f36b20; color: var(--accent); font-size: 19px; }
     .video-title { margin: 14px 0 6px; font-size: 17px; line-height: 1.4; overflow-wrap: anywhere; }
     .video-status { color: var(--muted); font-size: 10px; }
-    .video-buffer { display: flex; align-items: center; gap: 9px; margin-top: 7px; color: var(--muted); font-size: 10px; }
-    .video-buffer-bar { flex: 0 0 160px; height: 4px; border-radius: 2px; background: #ffffff1a; overflow: hidden; }
-    .video-buffer-fill { height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+    .video-transport { position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; display: flex; align-items: center; gap: 10px; padding: 24px 14px 10px; background: linear-gradient(transparent, #000000cc); color: #f2f2e9; font-size: 10px; transition: opacity .25s; }
+    .video-stage.controls-hidden .video-transport { opacity: 0; pointer-events: none; }
+    .video-stage.controls-hidden { cursor: none; }
+    .video-transport button { flex: 0 0 auto; width: 30px; height: 30px; border: 0; border-radius: 50%; background: #ffffff24; color: #f2f2e9; font-size: 11px; cursor: pointer; }
+    .video-transport button:disabled { opacity: .35; cursor: default; }
+    .video-timeline { position: relative; flex: 1; height: 16px; display: flex; align-items: center; cursor: pointer; touch-action: none; }
+    .video-track { position: relative; width: 100%; height: 4px; border-radius: 2px; background: #ffffff33; overflow: hidden; transition: height .1s ease; }
+    .video-timeline:hover .video-track, .video-timeline.scrubbing .video-track { height: 6px; }
+    .video-buffered { position: absolute; inset: 0; }
+    .video-played { position: absolute; left: 0; top: 0; bottom: 0; }
+    .video-buffered i { position: absolute; top: 0; bottom: 0; background: #ffffff80; }
+    .video-played { width: 0; background: var(--accent); }
+    .video-thumb { position: absolute; top: 50%; left: 0; width: 13px; height: 13px; margin: -6.5px 0 0 -6.5px; border-radius: 50%; background: var(--accent); opacity: 0; transform: scale(.5); transition: opacity .1s, transform .1s; pointer-events: none; }
+    .video-timeline:hover .video-thumb, .video-timeline.scrubbing .video-thumb { opacity: 1; transform: scale(1); }
+    .video-hover-time { position: absolute; bottom: 20px; left: 0; transform: translateX(-50%); padding: 3px 6px; border-radius: 4px; background: #000000dd; color: #f2f2e9; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity .1s; }
+    .video-timeline:hover .video-hover-time, .video-timeline.scrubbing .video-hover-time { opacity: 1; }
+    .video-time { flex: 0 0 auto; min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
+    .video-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 9px; color: var(--muted); font-size: 10px; }
+    .video-controls select { font: inherit; color: inherit; background: #ffffff10; border: 1px solid var(--border); border-radius: 7px; padding: 3px 6px; margin-left: 6px; }
     .up-next { overflow: hidden; }
     .up-next .card-head { padding-bottom: 11px; }
     .up-next .media-list { max-height: 550px; padding-top: 0; }
@@ -245,15 +265,25 @@ CLIENT_HTML = """<!doctype html>
         </div>
         <div class="video-layout">
           <section class="video-main">
-            <div class="video-stage">
-              <video id="video-player" controls playsinline></video>
+            <div id="video-stage" class="video-stage">
+              <video id="video-player" playsinline></video>
               <div id="video-placeholder" class="video-placeholder">
                 <div class="play-mark">▶</div><strong>Choose a video to start watching</strong>
                 <span>Your video plays right here in Audionator.</span>
               </div>
+              <div id="video-transport" class="video-transport">
+                <button id="video-toggle" type="button" disabled aria-label="Play or pause">▶</button>
+                <div id="video-timeline" class="video-timeline">
+                  <div class="video-track"><div id="video-buffered" class="video-buffered"></div><div id="video-played" class="video-played"></div></div>
+                  <div id="video-thumb" class="video-thumb"></div>
+                  <div id="video-hover-time" class="video-hover-time"></div>
+                </div>
+                <span id="video-time" class="video-time">0:00 / 0:00</span>
+                <button id="video-fullscreen" type="button" disabled aria-label="Fullscreen">⛶</button>
+              </div>
             </div>
             <div class="section-heading">
-              <div><h2 id="video-title" class="video-title">Pick something from Up next</h2><div id="video-status" class="video-status">Videos stream over reliable UDP from your server.</div><div id="video-buffer" class="video-buffer"><span id="video-buffer-text">Buffer: —</span><div class="video-buffer-bar"><div id="video-buffer-fill" class="video-buffer-fill"></div></div></div></div>
+              <div><h2 id="video-title" class="video-title">Pick something from Up next</h2><div id="video-status" class="video-status">Videos stream over reliable UDP from your server.</div><div class="video-controls"><label>Quality<select id="video-quality" aria-label="Video quality" disabled><option value="auto">Auto</option></select></label><span id="video-traffic">Traffic: —</span></div></div>
               <button id="close-video" class="button secondary" style="display:none">Close player</button>
             </div>
           </section>
@@ -291,6 +321,15 @@ CLIENT_HTML = """<!doctype html>
             <button id="join-session-button" class="button secondary" disabled>Join</button>
             <button id="create-session-button" class="button primary" disabled>New session</button>
             <button id="leave-session-button" class="button secondary" style="display: none">Leave</button>
+          </div>
+        </section>
+        <section class="card connect-card">
+          <div class="eyebrow">CONNECTION HEALTH</div>
+          <div class="health-grid">
+            <div class="health-metric"><div class="health-label">Average latency</div><div id="health-average" class="health-value">—</div></div>
+            <div class="health-metric"><div class="health-label">Maximum latency</div><div id="health-maximum" class="health-value">—</div></div>
+            <div class="health-metric"><div class="health-label">Packet loss</div><div id="health-loss" class="health-value">—</div></div>
+            <div class="health-metric"><div class="health-label">Latency samples</div><div id="health-samples" class="health-value">—</div></div>
           </div>
         </section>
       </section>
@@ -439,10 +478,9 @@ CLIENT_HTML = """<!doctype html>
       if (type === "video") {
         navigate("videos");
         $("video-title").textContent = item.name;
-        $("video-status").textContent = "Buffering video over reliable UDP…";
+        $("video-status").textContent = "Opening the video…";
         $("video-placeholder").style.display = "none";
         $("close-video").style.display = "";
-        const player = $("video-player");
         try {
           const result = await window.pywebview.api.play_video(item.name);
           if (!result.ok) {
@@ -452,11 +490,7 @@ CLIENT_HTML = """<!doctype html>
             showStatus(result.message, true);
             return;
           }
-          player.src = `/video.mp4?play=${Date.now()}`;
-          player.load();
-          player.play().catch(() => {
-            $("video-status").textContent = "Ready. Use the player controls to start playback.";
-          });
+          await startVideoPlayer();
         } catch (error) {
           $("video-status").textContent = `Could not open video: ${error.message || error}`;
           $("video-placeholder").style.display = "grid";
@@ -499,6 +533,11 @@ CLIENT_HTML = """<!doctype html>
         $("session-summary").textContent = session.code
           ? `In session ${session.code} · ${session.members} listening`
           : "Not in a session. Create one, or join with a code from the host.";
+        const measured = (value, unit) => current.connected && value !== null ? `${value}${unit}` : "—";
+        $("health-average").textContent = measured(current.latency.average_ms, " ms");
+        $("health-maximum").textContent = measured(current.latency.max_ms, " ms");
+        $("health-loss").textContent = measured(current.loss.percent, "%");
+        $("health-samples").textContent = current.connected ? String(current.latency.samples) : "—";
         $("leave-session-button").style.display = session.code ? "" : "none";
         $("create-session-button").disabled = !current.connected;
         $("join-session-button").disabled = !current.connected;
@@ -528,6 +567,7 @@ CLIENT_HTML = """<!doctype html>
         $("audio-elapsed").textContent = formatTime(current.audio.position);
         $("audio-duration").textContent = formatTime(current.audio.duration);
         if (current.video.status) $("video-status").textContent = current.video.status;
+        updateVideoSession(current.video);
         if (current.message !== state.lastMessage) {
           showStatus(current.message, current.error);
           state.lastMessage = current.message;
@@ -583,6 +623,7 @@ CLIENT_HTML = """<!doctype html>
       } catch (error) { showStatus(`Could not open folder: ${error.message || error}`, true); }
     });
     $("close-video").addEventListener("click", async () => {
+      stopVideoPlayer();
       const player = $("video-player");
       player.pause();
       player.removeAttribute("src");
@@ -590,31 +631,336 @@ CLIENT_HTML = """<!doctype html>
       $("video-placeholder").style.display = "grid";
       $("video-title").textContent = "Pick something from Up next";
       $("video-status").textContent = "Videos stream over reliable UDP from your server.";
-      updateBufferIndicator();
+      setTransportEnabled(false);
+      updateVideoTimeline();
       await apiReady;
       try { await window.pywebview.api.close_video(); }
       catch (error) { showStatus(`Could not close the video: ${error.message || error}`, true); }
     });
-    function updateBufferIndicator() {
+    const VIDEO_AHEAD_SECONDS = 20;
+    const VIDEO_KEEP_BEHIND_SECONDS = 30;
+    const videoRun = { id: 0, controller: null, mediaSource: null, sourceBuffer: null, objectUrl: null, info: null, index: 0, level: null, restarting: false, restartAt: -1 };
+
+    function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+    function bufferOperation(sourceBuffer, operation) {
+      return new Promise((resolve, reject) => {
+        const cleanup = () => {
+          sourceBuffer.removeEventListener("updateend", done);
+          sourceBuffer.removeEventListener("error", failed);
+        };
+        const done = () => { cleanup(); resolve(); };
+        const failed = () => { cleanup(); reject(new Error("The browser rejected part of the video.")); };
+        sourceBuffer.addEventListener("updateend", done);
+        sourceBuffer.addEventListener("error", failed);
+        try { operation(); } catch (error) { cleanup(); reject(error); }
+      });
+    }
+
+    function whenIdle(sourceBuffer) {
+      if (!sourceBuffer.updating) return Promise.resolve();
+      return new Promise(resolve => sourceBuffer.addEventListener("updateend", resolve, { once: true }));
+    }
+
+    function secondsBufferedAhead(sourceBuffer, time) {
+      const ranges = sourceBuffer.buffered;
+      if (!ranges.length) return 0;
+      return Math.max(0, ranges.end(ranges.length - 1) - time);
+    }
+
+    function isTimeBuffered(time) {
       const player = $("video-player");
-      const duration = player.duration;
-      let bufferedEnd = 0;
-      let ahead = 0;
       for (let i = 0; i < player.buffered.length; i++) {
-        const start = player.buffered.start(i);
-        const end = player.buffered.end(i);
-        if (start <= player.currentTime && player.currentTime <= end) {
-          bufferedEnd = end;
-          ahead = end - player.currentTime;
+        if (time >= player.buffered.start(i) - 0.1 && time <= player.buffered.end(i) + 0.1) return true;
+      }
+      return false;
+    }
+
+    function showVideoError(message) {
+      $("video-status").textContent = message;
+      showStatus(message, true);
+    }
+
+    function setVideoQualityOptions(info) {
+      const options = ['<option value="auto">Auto</option>'];
+      for (const level of info.levels) options.push(`<option value="${level.id}">${level.id}</option>`);
+      const select = $("video-quality");
+      select.innerHTML = options.join("");
+      select.value = info.mode || "auto";
+      select.disabled = false;
+    }
+
+    function updateVideoSession(video) {
+      const info = video.session;
+      const select = $("video-quality");
+      if (!info || info.status !== "ready") {
+        $("video-traffic").textContent = "Traffic: —";
+        return;
+      }
+      if (select.options.length && select.value !== info.mode) select.value = info.mode;
+      const mode = info.mode === "auto" ? "Auto" : "Manual";
+      const level = info.level ? ` · ${info.level}` : "";
+      $("video-traffic").textContent = `Quality ${mode}${level} · Traffic ${(info.traffic_bps / 1000000).toFixed(2)} Mb/s`;
+    }
+
+    function stopVideoPlayer() {
+      videoRun.id += 1;
+      clearInterval(timelineTimer);
+      timelineTimer = null;
+      pendingSeek = null;
+      if (videoRun.controller) videoRun.controller.abort();
+      if (videoRun.objectUrl) URL.revokeObjectURL(videoRun.objectUrl);
+      Object.assign(videoRun, { controller: null, mediaSource: null, sourceBuffer: null, objectUrl: null, info: null, index: 0, level: null, restarting: false, restartAt: -1 });
+    }
+
+    async function waitForVideoManifest(runId) {
+      while (runId === videoRun.id) {
+        const response = await fetch("/video/manifest", { cache: "no-store" });
+        if (!response.ok) throw new Error(await response.text());
+        const info = await response.json();
+        if (info.status === "ready") return info;
+        if (info.status === "error") throw new Error(info.message);
+        $("video-status").textContent = info.message || "Preparing the video on the server…";
+        await sleep(500);
+      }
+      throw new Error("The video was closed.");
+    }
+
+    async function startVideoPlayer() {
+      stopVideoPlayer();
+      const runId = videoRun.id;
+      const alive = () => runId === videoRun.id;
+      const player = $("video-player");
+      $("video-quality").disabled = true;
+      try {
+        const info = await waitForVideoManifest(runId);
+        if (!alive()) return;
+        const mime = `video/mp4; codecs="${info.codecs}"`;
+        if (!window.MediaSource || !MediaSource.isTypeSupported(mime)) {
+          throw new Error("This Windows WebView2 build cannot play the video's codecs.");
+        }
+        const mediaSource = new MediaSource();
+        const opened = new Promise(resolve => mediaSource.addEventListener("sourceopen", resolve, { once: true }));
+        const objectUrl = URL.createObjectURL(mediaSource);
+        Object.assign(videoRun, { mediaSource, objectUrl, info });
+        player.src = objectUrl;
+        await opened;
+        if (!alive()) return;
+        mediaSource.duration = info.duration;
+        setTransportEnabled(true);
+        const sourceBuffer = mediaSource.addSourceBuffer(mime);
+        sourceBuffer.mode = "sequence";
+        Object.assign(videoRun, { sourceBuffer, controller: new AbortController(), index: 0, level: null });
+        setVideoQualityOptions(info);
+        $("video-status").textContent = "Buffering…";
+        pumpVideoSegments(runId);
+        clearInterval(timelineTimer);
+        timelineTimer = setInterval(updateVideoTimeline, 250);
+        player.play().catch(() => {
+          $("video-status").textContent = "Ready. Use the player controls to start playback.";
+        });
+      } catch (error) {
+        if (alive()) showVideoError(`Could not play this video: ${error.message || error}`);
+      }
+    }
+
+    async function pumpVideoSegments(runId) {
+      const alive = () => runId === videoRun.id;
+      const player = $("video-player");
+      const { info, sourceBuffer, controller, mediaSource } = videoRun;
+      try {
+        while (alive() && videoRun.index < info.segment_count) {
+          if (secondsBufferedAhead(sourceBuffer, player.currentTime) >= VIDEO_AHEAD_SECONDS) {
+            await sleep(400);
+            continue;
+          }
+          const keepFrom = player.currentTime - VIDEO_KEEP_BEHIND_SECONDS;
+          if (keepFrom > 0 && sourceBuffer.buffered.length && sourceBuffer.buffered.start(0) < keepFrom) {
+            await bufferOperation(sourceBuffer, () => sourceBuffer.remove(0, keepFrom));
+            if (!alive()) return;
+          }
+          const index = videoRun.index;
+          const response = await fetch(`/video/segment/${index}`, { cache: "no-store", signal: controller.signal });
+          if (!response.ok) throw new Error(await response.text());
+          const level = response.headers.get("X-Video-Level");
+          const bytes = await response.arrayBuffer();
+          if (!alive()) return;
+          if (level !== videoRun.level) {
+            const initResponse = await fetch(`/video/init/${level}`, { cache: "no-store", signal: controller.signal });
+            if (!initResponse.ok) throw new Error(await initResponse.text());
+            const init = await initResponse.arrayBuffer();
+            if (!alive()) return;
+            await bufferOperation(sourceBuffer, () => sourceBuffer.appendBuffer(init));
+            if (!alive()) return;
+            videoRun.level = level;
+          }
+          sourceBuffer.timestampOffset = index * info.segment_seconds;
+          await bufferOperation(sourceBuffer, () => sourceBuffer.appendBuffer(bytes));
+          if (!alive()) return;
+          videoRun.index = index + 1;
+        }
+        if (alive() && mediaSource.readyState === "open") {
+          await whenIdle(sourceBuffer);
+          mediaSource.endOfStream();
+        }
+      } catch (error) {
+        if (alive() && error.name !== "AbortError") showVideoError(`Playback stopped: ${error.message || error}`);
+      }
+    }
+
+    async function restartVideoAt(seconds) {
+      const { info, sourceBuffer } = videoRun;
+      if (!info || !sourceBuffer) return;
+      if (videoRun.controller) videoRun.controller.abort();
+      videoRun.id += 1;
+      const runId = videoRun.id;
+      videoRun.controller = new AbortController();
+      videoRun.restarting = true;
+      videoRun.restartAt = seconds;
+      const player = $("video-player");
+      try {
+        await whenIdle(sourceBuffer);
+        if (sourceBuffer.buffered.length) await bufferOperation(sourceBuffer, () => sourceBuffer.remove(0, Infinity));
+        videoRun.index = Math.min(info.segment_count - 1, Math.max(0, Math.floor(seconds / info.segment_seconds)));
+        videoRun.level = null;
+        player.currentTime = seconds;
+      } catch (error) {
+        if (runId === videoRun.id) showVideoError(`Could not seek: ${error.message || error}`);
+        return;
+      } finally {
+        videoRun.restarting = false;
+      }
+      pumpVideoSegments(runId);
+    }
+
+    function onVideoSeeking() {
+      const player = $("video-player");
+      if (!videoRun.sourceBuffer || videoRun.restarting) return;
+      if (Math.abs(player.currentTime - videoRun.restartAt) < 0.25) return;
+      if (isTimeBuffered(player.currentTime)) return;
+      restartVideoAt(player.currentTime);
+    }
+
+    let scrubTime = null;
+    let pendingSeek = null;
+    let controlsTimer = null;
+    let timelineTimer = null;
+
+    function setTransportEnabled(enabled) {
+      $("video-toggle").disabled = !enabled;
+      $("video-fullscreen").disabled = !enabled;
+    }
+
+    function showHoverTime(event, time) {
+      const rect = $("video-timeline").getBoundingClientRect();
+      $("video-hover-time").style.left = `${event.clientX - rect.left}px`;
+      $("video-hover-time").textContent = formatTime(time);
+    }
+
+    function scheduleControlsHide() {
+      clearTimeout(controlsTimer);
+      controlsTimer = setTimeout(() => {
+        if (!$("video-player").paused && scrubTime === null && !$("video-stage").matches(":hover")) {
+          $("video-stage").classList.add("controls-hidden");
+        }
+      }, 2500);
+    }
+
+    function wakeControls() {
+      $("video-stage").classList.remove("controls-hidden");
+      scheduleControlsHide();
+    }
+
+    function updateVideoTimeline() {
+      const player = $("video-player");
+      const duration = videoRun.info && videoRun.info.duration > 0 ? videoRun.info.duration : 0;
+      const hasSource = Boolean(player.currentSrc) && duration > 0;
+      const shown = hasSource ? Math.min(duration, scrubTime ?? pendingSeek ?? player.currentTime) : 0;
+      const percent = value => (duration > 0 ? `${Math.min(100, Math.max(0, 100 * value / duration)).toFixed(2)}%` : "0%");
+      let buffered = "";
+      if (hasSource) {
+        for (let i = 0; i < player.buffered.length; i++) {
+          const start = player.buffered.start(i);
+          buffered += `<i style="left:${percent(start)};width:${percent(player.buffered.end(i) - start)}"></i>`;
         }
       }
-      const hasDuration = Number.isFinite(duration) && duration > 0;
-      $("video-buffer-text").textContent = player.currentSrc ? `Buffered ${ahead.toFixed(0)} s ahead` : "Buffer: —";
-      $("video-buffer-fill").style.width = player.currentSrc && hasDuration ? `${Math.min(100, 100 * bufferedEnd / duration).toFixed(1)}%` : "0%";
+      $("video-buffered").innerHTML = buffered;
+      $("video-played").style.width = percent(shown);
+      $("video-thumb").style.left = percent(shown);
+      $("video-time").textContent = hasSource ? `${formatTime(shown)} / ${formatTime(duration)}` : "0:00 / 0:00";
+      $("video-toggle").textContent = player.paused ? "▶" : "❚❚";
     }
-    for (const eventName of ["loadstart", "progress", "timeupdate", "seeked", "emptied", "durationchange", "loadedmetadata"]) {
-      $("video-player").addEventListener(eventName, updateBufferIndicator);
+
+    function togglePlayback() {
+      const player = $("video-player");
+      if (!player.currentSrc) return;
+      if (player.paused) player.play().catch(() => {});
+      else player.pause();
     }
+
+    function timeAtPointer(event) {
+      const duration = videoRun.info ? videoRun.info.duration : 0;
+      if (!$("video-player").currentSrc || !(duration > 0)) return null;
+      const rect = $("video-timeline").getBoundingClientRect();
+      const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+      return fraction * duration;
+    }
+
+    $("video-toggle").addEventListener("click", togglePlayback);
+    $("video-player").addEventListener("click", togglePlayback);
+    $("video-fullscreen").addEventListener("click", () => {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else document.querySelector(".video-stage").requestFullscreen().catch(() => {});
+    });
+    $("video-timeline").addEventListener("pointerdown", event => {
+      scrubTime = timeAtPointer(event);
+      if (scrubTime === null) return;
+      $("video-timeline").setPointerCapture(event.pointerId);
+      $("video-timeline").classList.add("scrubbing");
+      updateVideoTimeline();
+    });
+    $("video-timeline").addEventListener("pointermove", event => {
+      const time = timeAtPointer(event);
+      if (time === null) return;
+      showHoverTime(event, time);
+      if (scrubTime === null) return;
+      scrubTime = time;
+      updateVideoTimeline();
+    });
+    $("video-timeline").addEventListener("pointerup", () => {
+      if (scrubTime === null) return;
+      const target = scrubTime;
+      scrubTime = null;
+      $("video-timeline").classList.remove("scrubbing");
+      pendingSeek = target;
+      $("video-player").currentTime = target;
+      updateVideoTimeline();
+    });
+    $("video-timeline").addEventListener("pointercancel", () => {
+      scrubTime = null;
+      $("video-timeline").classList.remove("scrubbing");
+      updateVideoTimeline();
+    });
+    $("video-stage").addEventListener("pointermove", wakeControls);
+    $("video-stage").addEventListener("pointerdown", wakeControls);
+    $("video-stage").addEventListener("pointerleave", scheduleControlsHide);
+    $("video-player").addEventListener("play", wakeControls);
+    $("video-player").addEventListener("pause", wakeControls);
+    $("video-player").addEventListener("seeked", () => { pendingSeek = null; });
+    $("video-player").addEventListener("emptied", () => { pendingSeek = null; });
+    for (const eventName of ["loadstart", "progress", "timeupdate", "seeking", "seeked", "emptied", "durationchange", "loadedmetadata", "play", "pause", "ended"]) {
+      $("video-player").addEventListener(eventName, () => updateVideoTimeline());
+    }
+    $("video-player").addEventListener("seeking", onVideoSeeking);
+    $("video-quality").addEventListener("change", async event => {
+      await apiReady;
+      try {
+        const result = await window.pywebview.api.set_video_quality(event.target.value);
+        if (!result.ok) showStatus(result.message, true);
+      } catch (error) {
+        showStatus(`Could not change quality: ${error.message || error}`, true);
+      }
+    });
     window.addEventListener("load", async () => {
       const bars = [18, 30, 42, 26, 50, 34, 22, 46, 28, 38, 17, 32, 24];
       bars.forEach((height, index) => {

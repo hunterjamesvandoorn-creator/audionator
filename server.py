@@ -35,7 +35,7 @@ from udp_protocol import (
     pack_message,
     unpack_message,
 )
-from video_service import VideoPreparationService
+from video_service import INIT_SEGMENT_INDEX, VideoPreparationService, manifest_summary
 
 
 TRANSFER_TIMEOUT = 30.0
@@ -270,14 +270,54 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
             name = message.get("name")
             try:
                 path, media_type = self._find_media_file(name)
-                if media_type == "video":
-                    path = self.server.video_service.prepare(path.name)
             except (OSError, RuntimeError, ValueError) as error:
                 self._send_control(client_address, transfer_id, {"type": "ERROR", "message": str(error)})
+                return
+            if media_type == "video":
+                self._send_control(
+                    client_address,
+                    transfer_id,
+                    {"type": "ERROR", "message": "Videos are streamed as adaptive segments."},
+                )
                 return
             threading.Thread(
                 target=self._send_file,
                 args=(path, transfer_id, client_address),
+                daemon=True,
+            ).start()
+        elif command == "MANIFEST":
+            name = message.get("name")
+            try:
+                video_path = self._find_video_file(name)
+                prepared = self.server.video_service.prepare(video_path.name)
+            except (OSError, RuntimeError, ValueError) as error:
+                self._send_control(client_address, transfer_id, {"type": "ERROR", "message": str(error)})
+                return
+            self._send_control(
+                client_address,
+                transfer_id,
+                {"type": "MANIFEST", "name": video_path.name, **manifest_summary(prepared.manifest)},
+            )
+        elif command == "SEGMENT":
+            name = message.get("name")
+            try:
+                video_path = self._find_video_file(name)
+                segment = self.server.video_service.segment_path(
+                    video_path.name,
+                    message.get("level"),
+                    message.get("index"),
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                self._send_control(client_address, transfer_id, {"type": "ERROR", "message": str(error)})
+                return
+            level = message.get("level")
+            index = message.get("index")
+            display_name = (
+                f"{level}-init.mp4" if index == INIT_SEGMENT_INDEX else f"{level}-{index:05d}.mp4"
+            )
+            threading.Thread(
+                target=self._send_file,
+                args=(segment, transfer_id, client_address, display_name),
                 daemon=True,
             ).start()
         else:
@@ -286,6 +326,12 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                 transfer_id,
                 {"type": "ERROR", "message": "Unknown server command."},
             )
+
+    def _find_video_file(self, name: Any) -> Path:
+        path, media_type = self._find_media_file(name)
+        if media_type != "video":
+            raise ValueError("That file is not a video.")
+        return path
 
     def _find_media_file(self, name: Any) -> tuple[Path, str]:
         if not isinstance(name, str) or not name or Path(name).name != name or "\x00" in name:
@@ -328,9 +374,10 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         path: Path,
         transfer_id: bytes,
         client_address: tuple[str, int],
+        display_name: str | None = None,
     ) -> None:
         try:
-            self._transfer_file(path, transfer_id, client_address)
+            self._transfer_file(path, transfer_id, client_address, display_name)
         except OSError as error:
             self._send_control(
                 client_address,
@@ -343,11 +390,13 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         path: Path,
         transfer_id: bytes,
         client_address: tuple[str, int],
+        display_name: str | None = None,
     ) -> None:
+        name = display_name or path.name
         size = path.stat().st_size
         chunks = (size + CHUNK_SIZE - 1) // CHUNK_SIZE
         digest = self._sha256(path)
-        media_type = "video" if path.suffix.lower() == ".mp4" else "audio"
+        media_type = "video" if Path(name).suffix.lower() == ".mp4" else "audio"
         buffer_bytes = min(size, VIDEO_START_BUFFER_BYTES) if media_type == "video" else 0
         acknowledgements = self.server.register_transfer(transfer_id, client_address)
         pending: dict[int, tuple[bytes, float, int]] = {}
@@ -361,7 +410,7 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
                 transfer_id,
                 {
                     "type": "START",
-                    "name": path.name,
+                    "name": name,
                     "size": size,
                     "chunk_size": CHUNK_SIZE,
                     "chunks": chunks,
@@ -441,6 +490,18 @@ class AudioUDPHandler(socketserver.BaseRequestHandler):
         return digest.hexdigest()
 
 
+def _prepare_library(service: VideoPreparationService) -> None:
+    for name in service.video_names():
+        started = time.monotonic()
+        try:
+            service.prepare(name)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"Could not prepare {name}: {error}")
+            continue
+        print(f"Prepared {name} in {time.monotonic() - started:.0f} s")
+    print("All videos are prepared for adaptive streaming.")
+
+
 def run_udp_server(
     host: str,
     port: int,
@@ -453,7 +514,8 @@ def run_udp_server(
     print(f"Audionator reliable UDP server listening on {host}:{port}")
     print(f"Audio library: {server.library}")
     print(f"Video library: {server.video_library}")
-    print("MP4 videos are prepared for progressive playback the first time a client opens them.")
+    print("Videos are encoded at 720p, 480p and 360p in the background. Clients can start before this finishes.")
+    threading.Thread(target=_prepare_library, args=(server.video_service,), daemon=True).start()
     print("Share the server computer's LAN IP with the receiving client. Press Ctrl+C to stop.")
     try:
         server.serve_forever()

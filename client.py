@@ -21,7 +21,8 @@ from mutagen.mp3 import MP3
 
 from audio_stream import StreamingAudioFile
 from receiver import AudioReceiver
-from video_stream import ProgressiveVideoHTTPServer
+from video_session import AdaptiveVideoSession
+from video_stream import VideoHTTPServer
 
 RESUME_END_MARGIN_SECONDS = 5.0
 POSITION_SAVE_INTERVAL_SECONDS = 5.0
@@ -37,7 +38,7 @@ class AudionatorAPI:
     def __init__(
         self,
         download_directory: Path,
-        video_server: ProgressiveVideoHTTPServer,
+        video_server: VideoHTTPServer,
         settings_path: Path | None = None,
     ) -> None:
         self.download_directory = download_directory
@@ -69,7 +70,7 @@ class AudionatorAPI:
                 }
         except (OSError, ValueError) as error:
             self._set_message(f"Could not load saved connection settings: {error}", is_error=True)
-        self.video_receiver: AudioReceiver | None = None
+        self.video_session: AdaptiveVideoSession | None = None
         self.media_by_type: dict[str, list[dict[str, Any]]] = {"audio": [], "video": []}
         self.connected_server: tuple[str, int] | None = None
         self.connected = False
@@ -187,23 +188,33 @@ class AudionatorAPI:
         receiver = AudioReceiver(self.download_directory)
         try:
             receiver.connect(*self.connected_server)
-            transfer_id = receiver.request_file(name)
-            self.video_server.set_video_source(receiver, transfer_id)
         except (OSError, RuntimeError, ValueError) as error:
             receiver.close()
             self._set_message(f"Could not open the video stream: {error}", is_error=True)
             return {"ok": False, "message": str(error)}
-        self.video_receiver = receiver
-        self.video_status = "Buffering video over reliable UDP…"
+        session = AdaptiveVideoSession(receiver, name)
+        session.start()
+        self.video_session = session
+        self.video_server.set_video_session(session)
+        self.video_status = ""
         self.message = f"Opening {name} in the built-in player…"
         self.error = False
         return {"ok": True}
 
+    def set_video_quality(self, mode: str) -> dict[str, Any]:
+        if not self.video_session:
+            return self._failure("Open a video before choosing its quality.")
+        try:
+            self.video_session.set_quality(str(mode))
+        except (RuntimeError, ValueError) as error:
+            return self._failure(str(error))
+        return {"ok": True}
+
     def close_video(self) -> dict[str, Any]:
-        self.video_server.clear_video_source()
-        if self.video_receiver:
-            self.video_receiver.close()
-            self.video_receiver = None
+        self.video_server.clear_video_session()
+        if self.video_session:
+            self.video_session.close()
+            self.video_session = None
         self.video_status = ""
         return {"ok": True}
 
@@ -268,7 +279,7 @@ class AudionatorAPI:
             return {"ok": False, "message": message}
 
     def _packet_loss(self) -> dict[str, Any]:
-        receivers = [self.receiver] + ([self.video_receiver] if self.video_receiver else [])
+        receivers = [self.receiver] + ([self.video_session.receiver] if self.video_session else [])
         counts = [receiver.loss_counts() for receiver in receivers]
         missed = sum(count[0] for count in counts)
         packets = sum(count[1] for count in counts)
@@ -280,8 +291,8 @@ class AudionatorAPI:
 
     def get_state(self) -> dict[str, Any]:
         self._process_receiver_events(self.receiver, is_video=False)
-        if self.video_receiver:
-            self._process_receiver_events(self.video_receiver, is_video=True)
+        if self.video_session:
+            self._process_receiver_events(self.video_session.receiver, is_video=True)
         if self.connection_deadline is not None and time.monotonic() >= self.connection_deadline:
             self.connection_deadline = None
             self.connected = False
@@ -323,7 +334,11 @@ class AudionatorAPI:
                 "position": self._current_position() if self.current_path else 0,
                 "duration": self.track_duration,
             },
-            "video": {"status": self.video_status, "active": self.video_receiver is not None},
+            "video": {
+                "active": self.video_session is not None,
+                "status": self.video_status,
+                "session": self.video_session.describe() if self.video_session else None,
+            },
             "session": {"code": self.session_code if self.connected else None, "members": self.session_members},
         }
 
@@ -418,17 +433,11 @@ class AudionatorAPI:
             self._set_message(payload["message"], is_error=True)
 
     def _handle_video_event(self, event: str, payload: dict[str, Any]) -> None:
-        if event == "transfer_started":
-            self.video_status = f"Receiving video… 0%"
-        elif event == "transfer_progress":
-            total = payload["total"]
-            percent = 100 if total == 0 else 100 * payload["received"] / total
-            self.video_status = f"Receiving video… {percent:.0f}%"
-        elif event == "transfer_complete":
-            self.video_status = "Video received. You can keep watching or close the player."
-        elif event == "error":
-            self.video_status = payload["message"]
-            self._set_message(payload["message"], is_error=True)
+        # Segment progress is shown by the player itself, so only problems are reported here.
+        if event in {"connection_lost", "error"}:
+            self.video_status = str(payload["message"])
+        elif event == "connection_restored":
+            self.video_status = ""
 
     def _play_file(self, path: Path, track_name: str) -> None:
         self._remember_position()
@@ -620,11 +629,11 @@ def main() -> None:
         help="Folder where received MP3 files are saved",
     )
     args = parser.parse_args()
-    video_server: ProgressiveVideoHTTPServer | None = None
+    video_server: VideoHTTPServer | None = None
     api: AudionatorAPI | None = None
     server_thread: threading.Thread | None = None
     try:
-        video_server = ProgressiveVideoHTTPServer(("127.0.0.1", 0))
+        video_server = VideoHTTPServer(("127.0.0.1", 0))
         server_thread = threading.Thread(target=video_server.serve_forever, daemon=True)
         server_thread.start()
         api = AudionatorAPI(args.downloads, video_server)

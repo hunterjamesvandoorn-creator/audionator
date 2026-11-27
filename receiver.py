@@ -56,6 +56,13 @@ class _PendingControl:
     retries: int
 
 
+@dataclass
+class _Request:
+    event: threading.Event
+    response: dict[str, Any] | None = None
+    error: str | None = None
+
+
 class AudioReceiver:
     def __init__(self, download_directory: Path | None = None) -> None:
         self.download_directory = download_directory or Path(__file__).resolve().parent / "received"
@@ -67,6 +74,7 @@ class AudioReceiver:
         self._transfers: dict[bytes, dict[str, Any]] = {}
         self._transfer_errors: dict[bytes, str] = {}
         self._completed_transfers: set[bytes] = set()
+        self._requests: dict[bytes, _Request] = {}
         self._condition = threading.Condition()
         self._control_lock = threading.Lock()
         self._control_ids = itertools.count(1)
@@ -156,6 +164,77 @@ class AudioReceiver:
         )
         return transfer_id
 
+    def request_manifest(self, name: str, timeout: float) -> dict[str, Any]:
+        """Ask the server for a video's rendition summary. The server may take a while to prepare it."""
+        self._require_connection()
+        transfer_id = uuid.uuid4().bytes
+        request = _Request(threading.Event())
+        with self._condition:
+            self._requests[transfer_id] = request
+        try:
+            self._send_control(
+                {"command": "MANIFEST", "name": name},
+                transfer_id,
+                failure_message=f"Server did not return the video details for {name}.",
+            )
+            if not request.event.wait(timeout):
+                raise TimeoutError(f"The server did not finish preparing {name} in time.")
+            if request.error:
+                raise RuntimeError(request.error)
+            return request.response or {}
+        finally:
+            with self._condition:
+                self._requests.pop(transfer_id, None)
+
+    def request_segment(self, name: str, level: str, index: int) -> bytes:
+        """Start one segment transfer. Index -1 requests the level's init segment."""
+        self._require_connection()
+        transfer_id = uuid.uuid4().bytes
+        self._send_control(
+            {"command": "SEGMENT", "name": name, "level": level, "index": index},
+            transfer_id,
+            failure_message=f"Server did not respond to the request for {level} segment {index}.",
+        )
+        return transfer_id
+
+    def wait_for_transfer_complete(self, transfer_id: bytes, timeout: float | None = None) -> TransferSnapshot | None:
+        return self.wait_for_transfer_bytes(transfer_id, 1 << 62, timeout)
+
+    def release_transfer(self, transfer_id: bytes) -> None:
+        """Forget a finished transfer and delete its temporary file."""
+        with self._condition:
+            state = self._transfers.pop(transfer_id, None)
+            self._transfer_errors.pop(transfer_id, None)
+            self._completed_transfers.discard(transfer_id)
+            self._condition.notify_all()
+        if state:
+            stream = state.get("stream")
+            if stream and not stream.closed:
+                stream.close()
+            state["temporary_path"].unlink(missing_ok=True)
+
+    def _require_connection(self) -> None:
+        if not self._thread or not self._thread.is_alive():
+            raise RuntimeError("Connect to an audio server first.")
+
+    def _complete_request(self, transfer_id: bytes, message: dict[str, Any]) -> bool:
+        with self._condition:
+            request = self._requests.get(transfer_id)
+            if request is None:
+                return False
+            request.response = message
+            request.event.set()
+            return True
+
+    def _fail_request(self, transfer_id: bytes, error: str) -> bool:
+        with self._condition:
+            request = self._requests.get(transfer_id)
+            if request is None:
+                return False
+            request.error = error
+            request.event.set()
+            return True
+
     def wait_for_transfer_bytes(
         self,
         transfer_id: bytes,
@@ -212,6 +291,9 @@ class AudioReceiver:
         with self._condition:
             transfers = list(self._transfers.values())
             self._transfers.clear()
+            for request in self._requests.values():
+                request.error = request.error or "Connection closed."
+                request.event.set()
             self._condition.notify_all()
         if self._socket:
             self._socket.close()
@@ -299,6 +381,7 @@ class AudioReceiver:
     def _control_failed(self, pending: _PendingControl) -> None:
         if pending.transfer_id != bytes(16):
             self._discard_transfer(pending.transfer_id, pending.failure_message)
+            self._fail_request(pending.transfer_id, pending.failure_message)
         self.events.put(("error", {"message": pending.failure_message}))
 
     def _remember_control(self, control_id: int) -> bool:
@@ -370,8 +453,12 @@ class AudioReceiver:
                 self.events.put(("session", {"code": message["code"], "members": message["members"]}))
             elif response_type == "LEFT":
                 self.events.put(("left", {}))
+            elif response_type == "MANIFEST":
+                self._complete_request(transfer_id, message)
             elif response_type == "ERROR":
                 error = str(message.get("message", "Server error"))
+                if self._fail_request(transfer_id, error):
+                    return
                 self._discard_transfer(transfer_id, error)
                 self.events.put(("error", {"message": error}))
             return

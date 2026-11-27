@@ -1,107 +1,149 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 import imageio_ffmpeg
 
 from client import AudionatorAPI
-from receiver import TransferSnapshot
 from server import AudioUDPServer
-from video_stream import ProgressiveVideoHTTPServer
+from video_stream import VideoHTTPServer
 
 
-class FakeProgressiveReceiver:
-    def __init__(self, path: Path, size: int, buffer_bytes: int) -> None:
-        self.condition = threading.Condition()
-        self.snapshot = TransferSnapshot(path, size, buffer_bytes, buffer_bytes, False, None)
+def wait_for_manifest(base_url: str, timeout: float) -> dict:
+    deadline = time.monotonic() + timeout
+    while True:
+        with urlopen(f"{base_url}/video/manifest", timeout=5) as response:
+            info = json.loads(response.read().decode("utf-8"))
+        if info["status"] in {"ready", "error"} or time.monotonic() > deadline:
+            return info
+        time.sleep(0.2)
 
-    def wait_for_transfer_bytes(
-        self,
-        _transfer_id: bytes,
-        minimum_bytes: int,
-        timeout: float | None = None,
-    ) -> TransferSnapshot | None:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        with self.condition:
-            while (
-                self.snapshot.available_bytes < minimum_bytes
-                and not self.snapshot.complete
-                and not self.snapshot.error
-            ):
-                if deadline is None:
-                    self.condition.wait()
-                    continue
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return None
-                self.condition.wait(remaining)
-            return self.snapshot
 
-    def advance(self, available_bytes: int, complete: bool = False) -> None:
-        with self.condition:
-            self.snapshot = TransferSnapshot(
-                self.snapshot.path,
-                self.snapshot.size,
-                available_bytes,
-                self.snapshot.buffer_bytes,
-                complete,
-                None,
+class FakeSession:
+    def __init__(self, status: str = "ready", segment_error: Exception | None = None) -> None:
+        self.status = status
+        self.segment_error = segment_error
+
+    def describe(self) -> dict:
+        info = {"name": "clip.mp4", "status": self.status, "message": "", "traffic_bps": 0}
+        if self.status == "ready":
+            info.update(
+                {
+                    "segment_count": 2,
+                    "segment_seconds": 6,
+                    "last_segment_seconds": 6.0,
+                    "codecs": "avc1.640028,mp4a.40.2",
+                    "levels": [{"id": "480p", "height": 480, "bandwidth": 1296000}],
+                    "mode": "auto",
+                    "level": "480p",
+                    "throughput_bps": 0,
+                }
             )
-            self.condition.notify_all()
+        return info
+
+    def fetch_segment(self, index: int) -> tuple[str, bytes]:
+        if self.segment_error is not None:
+            raise self.segment_error
+        if not 0 <= index < 2:
+            raise ValueError("That video segment does not exist.")
+        return "480p", f"segment-{index}".encode("ascii")
+
+    def fetch_init(self, level_id: str) -> bytes:
+        if level_id != "480p":
+            raise ValueError("Unknown video quality.")
+        return b"init-480p"
 
 
-class ProgressiveVideoHTTPTests(unittest.TestCase):
-    def test_serves_available_bytes_before_transfer_completes(self) -> None:
-        content = bytes(range(256)) * 16
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            video_path = Path(temporary_directory) / "video.mp4"
-            video_path.write_bytes(content)
-            receiver = FakeProgressiveReceiver(video_path, len(content), 3)
-            transfer_id = bytes(range(16))
-            server = ProgressiveVideoHTTPServer(("127.0.0.1", 0), receiver, transfer_id)
-            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-            server_thread.start()
-            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+class AdaptiveRouteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = VideoHTTPServer(("127.0.0.1", 0))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
 
-            def continue_transfer() -> None:
-                time.sleep(0.3)
-                receiver.advance(128)
-                time.sleep(0.3)
-                receiver.advance(len(content), complete=True)
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
 
-            transfer_thread = threading.Thread(target=continue_transfer, daemon=True)
-            transfer_thread.start()
-            try:
-                with urlopen(base_url, timeout=5) as response:
-                    player_page = response.read().decode("utf-8")
-                self.assertIn('data-view="videos"', player_page)
-                self.assertIn('id="video-player"', player_page)
-                with urlopen(f"{base_url}/video.mp4", timeout=5) as response:
-                    self.assertEqual(response.headers.get("Content-Length"), str(len(content)))
-                    first_bytes = response.read(3)
-                    self.assertEqual(first_bytes, content[:3])
-                    self.assertFalse(receiver.snapshot.complete)
-                    self.assertEqual(first_bytes + response.read(), content)
+    def get(self, path: str) -> tuple[int, dict, bytes]:
+        try:
+            with urlopen(f"{self.base_url}{path}", timeout=5) as response:
+                return response.status, dict(response.headers), response.read()
+        except HTTPError as error:
+            return error.code, dict(error.headers), error.read()
 
-                request = Request(f"{base_url}/video.mp4", headers={"Range": "bytes=5-12"})
-                with urlopen(request, timeout=5) as response:
-                    self.assertEqual(response.status, 206)
-                    self.assertEqual(response.read(), content[5:13])
-            finally:
-                server.shutdown()
-                server.server_close()
-                server_thread.join(timeout=2)
-                transfer_thread.join(timeout=2)
+    def test_player_page_is_served(self) -> None:
+        status, _, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="video-player"', body)
+        self.assertIn(b'id="video-quality"', body)
+
+    def test_media_routes_report_no_open_video(self) -> None:
+        self.assertEqual(self.get("/video/manifest")[0], 409)
+        self.assertEqual(self.get("/video/segment/0")[0], 409)
+        self.assertEqual(self.get("/video/init/480p")[0], 409)
+
+    def test_manifest_reports_preparing_status(self) -> None:
+        self.server.set_video_session(FakeSession(status="preparing"))
+        status, _, body = self.get("/video/manifest")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["status"], "preparing")
+
+    def test_manifest_reports_ready_details(self) -> None:
+        self.server.set_video_session(FakeSession())
+        status, _, body = self.get("/video/manifest")
+        self.assertEqual(status, 200)
+        info = json.loads(body)
+        self.assertEqual(info["status"], "ready")
+        self.assertEqual(info["segment_count"], 2)
+
+    def test_segment_is_served_with_level_header(self) -> None:
+        self.server.set_video_session(FakeSession())
+        status, headers, body = self.get("/video/segment/1")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["X-Video-Level"], "480p")
+        self.assertEqual(headers["Content-Type"], "video/mp4")
+        self.assertEqual(body, b"segment-1")
+
+    def test_bad_segment_index_is_not_found(self) -> None:
+        self.server.set_video_session(FakeSession())
+        self.assertEqual(self.get("/video/segment/9")[0], 404)
+        self.assertEqual(self.get("/video/segment/abc")[0], 404)
+
+    def test_init_segment_is_served_and_unknown_level_is_not_found(self) -> None:
+        self.server.set_video_session(FakeSession())
+        self.assertEqual(self.get("/video/init/1080p")[0], 404)
+        status, _, body = self.get("/video/init/480p")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"init-480p")
+
+    def test_segment_timeout_is_gateway_timeout(self) -> None:
+        self.server.set_video_session(FakeSession(segment_error=TimeoutError("slow")))
+        self.assertEqual(self.get("/video/segment/0")[0], 504)
+
+    def test_failed_transfer_is_bad_gateway(self) -> None:
+        self.server.set_video_session(FakeSession(segment_error=RuntimeError("broken")))
+        self.assertEqual(self.get("/video/segment/0")[0], 502)
+
+    def test_segment_while_preparing_is_service_unavailable(self) -> None:
+        self.server.set_video_session(FakeSession(status="preparing", segment_error=RuntimeError("not yet")))
+        self.assertEqual(self.get("/video/segment/0")[0], 503)
+
+    def test_unknown_path_is_not_found(self) -> None:
+        self.assertEqual(self.get("/video.mp4")[0], 404)
 
 
 class VideoUDPTransferTests(unittest.TestCase):
-    def test_mp4_is_remuxed_and_received_over_reliable_udp(self) -> None:
+    def test_mp4_is_prepared_and_segments_are_served_over_http(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             music = root / "music"
@@ -143,7 +185,7 @@ class VideoUDPTransferTests(unittest.TestCase):
             server = AudioUDPServer(("127.0.0.1", 0), music, videos, root / "video-cache")
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
-            player_server = ProgressiveVideoHTTPServer(("127.0.0.1", 0))
+            player_server = VideoHTTPServer(("127.0.0.1", 0))
             player_thread = threading.Thread(target=player_server.serve_forever, daemon=True)
             player_thread.start()
             client = AudionatorAPI(downloads, player_server, root / "settings.json")
@@ -158,23 +200,21 @@ class VideoUDPTransferTests(unittest.TestCase):
                     time.sleep(0.05)
                 self.assertTrue(client.get_state()["connected"], "Client did not load the server library.")
                 self.assertTrue(client.play_video(source.name)["ok"])
-                receiver, transfer_id = player_server.get_video_source()
-                self.assertIsNotNone(receiver)
-                self.assertIsNotNone(transfer_id)
-                assert receiver is not None and transfer_id is not None
-                snapshot = receiver.wait_for_transfer_bytes(transfer_id, 1, timeout=30)
-                self.assertIsNotNone(snapshot, "Video transfer did not start.")
-                assert snapshot is not None
-                complete = receiver.wait_for_transfer_bytes(transfer_id, snapshot.size, timeout=30)
-                self.assertIsNotNone(complete, "Video transfer did not complete.")
-                assert complete is not None and complete.path is not None
-                with urlopen(f"http://127.0.0.1:{player_server.server_address[1]}/", timeout=5) as response:
-                    player_page = response.read().decode("utf-8")
-                self.assertIn('id="video-player"', player_page)
-                with urlopen(f"http://127.0.0.1:{player_server.server_address[1]}/video.mp4", timeout=5) as response:
-                    prepared = response.read()
-                self.assertEqual(prepared, complete.path.read_bytes())
-                self.assertLess(prepared.find(b"moov"), prepared.find(b"mdat"))
+                base_url = f"http://127.0.0.1:{player_server.server_address[1]}"
+                with urlopen(f"{base_url}/", timeout=5) as response:
+                    self.assertIn(b'id="video-player"', response.read())
+                manifest = wait_for_manifest(base_url, timeout=90)
+                self.assertEqual(manifest["status"], "ready", manifest.get("message"))
+                self.assertEqual([level["id"] for level in manifest["levels"]], ["720p", "480p", "360p"])
+                self.assertGreaterEqual(manifest["segment_count"], 1)
+                with urlopen(f"{base_url}/video/init/{manifest['level']}", timeout=30) as response:
+                    init = response.read()
+                self.assertIn(b"moov", init)
+                with urlopen(f"{base_url}/video/segment/0", timeout=30) as response:
+                    level = response.headers.get("X-Video-Level")
+                    segment = response.read()
+                self.assertIn(level, {"720p", "480p", "360p"})
+                self.assertIn(b"moof", segment)
             finally:
                 client.shutdown()
                 player_server.shutdown()
