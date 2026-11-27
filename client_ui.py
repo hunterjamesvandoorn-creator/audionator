@@ -120,6 +120,13 @@ CLIENT_HTML = """<!doctype html>
     .health-metric { padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: #11120f; }
     .health-label { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .8px; text-transform: uppercase; }
     .health-value { margin-top: 6px; font-size: 18px; font-weight: 650; letter-spacing: -.4px; }
+    [hidden] { display: none !important; }
+    .field select { height: 38px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; outline: none; background: #11120f; color: #f2f2e9; font-size: 11px; }
+    .traffic-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin: 18px 0 13px; }
+    .traffic-controls .field.count { width: 130px; }
+    .traffic-controls .field.target { flex: 1; min-width: 240px; }
+    .traffic-actions { display: flex; gap: 10px; }
+    #congestion-slider { width: 100%; margin-top: 8px; }
     .video-layout { display: grid; grid-template-columns: minmax(0, 1fr) 285px; align-items: start; gap: 16px; }
     .video-main, .up-next { min-width: 0; }
     .video-stage { position: relative; overflow: hidden; border: 1px solid var(--border); border-radius: 13px; background: #050605; aspect-ratio: 16 / 9; }
@@ -147,6 +154,16 @@ CLIENT_HTML = """<!doctype html>
     .video-time { flex: 0 0 auto; min-width: 84px; text-align: right; font-variant-numeric: tabular-nums; }
     .video-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 9px; color: var(--muted); font-size: 10px; }
     .video-controls select { font: inherit; color: inherit; background: #ffffff10; border: 1px solid var(--border); border-radius: 7px; padding: 3px 6px; margin-left: 6px; }
+    .download-graph { margin-top: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 11px; background: var(--panel); }
+    .graph-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    .graph-windows { display: flex; gap: 4px; }
+    .graph-windows button { min-width: 38px; height: 24px; border: 0; border-radius: 6px; background: #ffffff10; color: var(--muted); font-size: 10px; font-weight: 700; cursor: pointer; }
+    .graph-windows button.active { background: var(--accent); color: #171912; }
+    .download-chart { display: block; width: 100%; height: auto; margin-top: 10px; }
+    .chart-grid { stroke: #30332d; stroke-width: 1; }
+    .chart-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
+    .chart-label { fill: var(--muted); font-size: 10px; }
+    .graph-foot { display: flex; justify-content: space-between; margin-top: 6px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
     .up-next { overflow: hidden; }
     .up-next .card-head { padding-bottom: 11px; }
     .up-next .media-list { max-height: 550px; padding-top: 0; }
@@ -224,6 +241,7 @@ CLIENT_HTML = """<!doctype html>
         <button class="nav-item active" data-view="connect"><span class="nav-icon">⌁</span><span>Connect</span><span id="connection-dot" class="connection-dot" role="img" aria-label="Disconnected"></span></button>
         <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span><span>Settings</span></button>
         <button class="nav-item" data-view="account"><span class="nav-icon">◉</span><span>Account</span></button>
+        <button class="nav-item developer-only" data-view="developer" hidden><span class="nav-icon">{ }</span><span>Developer</span></button>
       </nav>
       <div class="sidebar-bottom">
         <div class="network-note">Media streams directly from your server over your local network.</div>
@@ -286,6 +304,16 @@ CLIENT_HTML = """<!doctype html>
               <div><h2 id="video-title" class="video-title">Pick something from Up next</h2><div id="video-status" class="video-status">Videos stream over reliable UDP from your server.</div><div class="video-controls"><label>Quality<select id="video-quality" aria-label="Video quality" disabled><option value="auto">Auto</option></select></label><span id="video-traffic">Traffic: —</span></div></div>
               <button id="close-video" class="button secondary" style="display:none">Close player</button>
             </div>
+            <div class="download-graph">
+              <div class="graph-head">
+                <div class="eyebrow">DOWNLOAD SPEED</div>
+                <div id="graph-windows" class="graph-windows" role="group" aria-label="Graph time window">
+                  <button type="button" data-seconds="30">30s</button><button type="button" class="active" data-seconds="60">1m</button><button type="button" data-seconds="120">2m</button><button type="button" data-seconds="300">5m</button><button type="button" data-seconds="600">10m</button><button type="button" data-seconds="1800">30m</button><button type="button" data-seconds="3600">1h</button>
+                </div>
+              </div>
+              <svg id="download-chart" class="download-chart" viewBox="0 0 640 170" role="img" aria-label="Download speed over time"></svg>
+              <div class="graph-foot"><span id="graph-now">Now: —</span><span id="graph-peak">Peak: —</span></div>
+            </div>
           </section>
           <aside class="card up-next">
             <div class="card-head"><h3>Up next</h3><span id="video-counts" class="counts">—</span></div>
@@ -341,6 +369,7 @@ CLIENT_HTML = """<!doctype html>
           <section class="card settings-card"><h2>Received music</h2><p id="settings-storage">MP3 tracks you receive are stored on this device.</p><button id="settings-open-folder" class="button secondary">Open received folder</button></section>
           <section class="card settings-card"><h2>Video playback</h2><p>Videos play inside this window using your system's WebView2 media support. The local player bridge is only available on this device.</p></section>
           <section class="card settings-card"><h2>Network</h2><p>Audionator uses UDP port 5005 on your local network. For your safety, use it only on a trusted network.</p></section>
+          <section class="card settings-card"><h2>Developer mode</h2><p id="settings-developer">Off. Turn on to show developer tools for demos and stress tests.</p><button id="settings-developer-toggle" class="button secondary">Turn on developer mode</button><button id="settings-open-developer" class="button primary" hidden>Open developer tools</button></section>
         </div>
       </section>
 
@@ -349,6 +378,34 @@ CLIENT_HTML = """<!doctype html>
         <section class="card account-card">
           <div class="avatar">G</div>
           <div><h2>Guest listener</h2><p>This local-network version does not use online accounts or sign-in. Your connection is made directly to the server you choose.</p></div>
+        </section>
+      </section>
+      <section id="page-developer" class="page">
+        <div class="page-head"><div class="eyebrow">DEVELOPER</div><h1 class="page-title">Developer tools</h1><p class="page-subtitle">Tools for demos and stress tests. The traffic simulator sends real network traffic to the server you are connected to.</p></div>
+        <section class="card connect-card">
+          <div class="eyebrow">TRAFFIC SIMULATOR</div>
+          <p class="help-text">Each simulated client is a separate receiver on this computer. Choose idle connections to hold heartbeats only, or a track for every client to download in a loop.</p>
+          <div class="traffic-controls">
+            <div class="field count"><label for="traffic-count">CLIENTS</label><input id="traffic-count" type="number" min="1" max="50" value="5"></div>
+            <div class="field target"><label for="traffic-target">TRAFFIC</label><select id="traffic-target"><option value="">Idle connections (heartbeats only)</option></select></div>
+          </div>
+          <div class="traffic-actions">
+            <button id="traffic-start" class="button primary">Start traffic</button>
+            <button id="traffic-stop" class="button secondary" disabled>Stop traffic</button>
+          </div>
+          <div class="health-grid">
+            <div class="health-metric"><div class="health-label">Connected clients</div><div id="traffic-connected" class="health-value">—</div></div>
+            <div class="health-metric"><div class="health-label">Completed downloads</div><div id="traffic-completed" class="health-value">—</div></div>
+            <div class="health-metric"><div class="health-label">Failed requests</div><div id="traffic-failed" class="health-value">—</div></div>
+            <div class="health-metric"><div class="health-label">Throughput</div><div id="traffic-throughput" class="health-value">—</div></div>
+          </div>
+          <p id="traffic-note" class="help-text" style="margin-top:12px"></p>
+        </section>
+        <section class="card connect-card">
+          <div class="eyebrow">CONGESTION SIMULATOR</div>
+          <p class="help-text">Limits video to a share of a simulated 10 Mb/s link. Nothing extra is sent over the network, so the laptop stays light. When the share drops below a level's bitrate, Auto quality steps down.</p>
+          <div class="field"><label for="congestion-slider">CONGESTION <span id="congestion-value">0% · 10.0 Mb/s available</span></label><input id="congestion-slider" type="range" min="0" max="95" step="1" value="0" aria-label="Simulated congestion"></div>
+          <p class="help-text" style="margin-top:12px">Applies to the video that is playing and to videos opened next. Audio is not limited.</p>
         </section>
       </section>
     </main>
@@ -382,7 +439,7 @@ CLIENT_HTML = """<!doctype html>
     });
     const state = {
       files: { audio: [], video: [] }, view: "connect", connected: false,
-      lastMessage: "", listKeys: { audio: "", video: "" }
+      lastMessage: "", listKeys: { audio: "", video: "" }, trafficTargets: "", congestionLinkBps: 0
     };
     const $ = id => document.getElementById(id);
     const formatTime = seconds => {
@@ -402,6 +459,49 @@ CLIENT_HTML = """<!doctype html>
       state.view = view;
       document.querySelectorAll(".page").forEach(page => page.classList.toggle("active", page.id === `page-${view}`));
       document.querySelectorAll(".nav-item").forEach(button => button.classList.toggle("active", button.dataset.view === view));
+    }
+    function setDeveloperMode(enabled) {
+      document.querySelectorAll(".developer-only").forEach(element => { element.hidden = !enabled; });
+      $("settings-developer").textContent = enabled
+        ? "On. Open developer tools below, or from the sidebar."
+        : "Off. Turn on to show developer tools for demos and stress tests.";
+      $("settings-developer-toggle").textContent = enabled ? "Turn off developer mode" : "Turn on developer mode";
+      $("settings-open-developer").hidden = !enabled;
+      $("settings-developer-toggle").dataset.enabled = String(enabled);
+      if (!enabled && state.view === "developer") navigate("settings");
+    }
+    function renderTraffic(current) {
+      const tracks = current.files.audio;
+      const targets = tracks.map(item => item.name).join("\\n");
+      if (targets !== state.trafficTargets) {
+        state.trafficTargets = targets;
+        const select = $("traffic-target");
+        const chosen = select.value;
+        select.replaceChildren(
+          new Option("Idle connections (heartbeats only)", ""),
+          ...tracks.map(item => new Option(`Download: ${item.name}`, item.name))
+        );
+        select.value = tracks.some(item => item.name === chosen) ? chosen : "";
+      }
+      const traffic = current.traffic;
+      const running = Boolean(traffic && traffic.running);
+      $("traffic-start").disabled = running || !current.connected;
+      $("traffic-stop").disabled = !running;
+      $("traffic-connected").textContent = traffic ? `${traffic.connected} of ${traffic.clients}` : "—";
+      $("traffic-completed").textContent = traffic ? String(traffic.completed) : "—";
+      $("traffic-failed").textContent = traffic ? String(traffic.failed) : "—";
+      $("traffic-throughput").textContent = traffic ? `${formatSize(traffic.bytes_per_second)}/s` : "—";
+      $("traffic-note").textContent = traffic && traffic.last_error ? `Last problem: ${traffic.last_error}` : "";
+    }
+    function congestionLabel(percent, linkBps) {
+      const available = linkBps * (100 - percent) / 100 / 1000000;
+      return `${percent}% · ${available.toFixed(1)} Mb/s available`;
+    }
+    function renderCongestion(congestion) {
+      const slider = $("congestion-slider");
+      state.congestionLinkBps = congestion.link_bps;
+      if (document.activeElement !== slider) slider.value = String(congestion.percent);
+      $("congestion-value").textContent = congestionLabel(Number.parseInt(slider.value, 10), congestion.link_bps);
     }
     function renderList(type) {
       const list = $(type === "audio" ? "audio-list" : "video-list");
@@ -554,6 +654,9 @@ CLIENT_HTML = """<!doctype html>
           ? `Connected to ${current.server.host}:${current.server.port}.`
           : "Not connected. Connect to the computer hosting your library.";
         $("settings-storage").textContent = current.download_directory;
+        setDeveloperMode(current.developer_mode);
+        renderTraffic(current);
+        renderCongestion(current.congestion);
         $("visualizer").classList.toggle("playing", current.audio.playing);
         $("mini-visualizer").classList.toggle("playing", current.audio.playing);
         $("close-video").style.display = current.video.active ? "" : "none";
@@ -621,6 +724,40 @@ CLIENT_HTML = """<!doctype html>
         const result = await window.pywebview.api.open_download_folder();
         if (!result.ok) showStatus(result.message, true);
       } catch (error) { showStatus(`Could not open folder: ${error.message || error}`, true); }
+    });
+    $("settings-developer-toggle").addEventListener("click", async event => {
+      await apiReady;
+      const enabled = event.currentTarget.dataset.enabled !== "true";
+      try {
+        const result = await window.pywebview.api.set_developer_mode(enabled);
+        if (!result.ok) showStatus(result.message, true);
+      } catch (error) { showStatus(`Could not change developer mode: ${error.message || error}`, true); }
+    });
+    $("settings-open-developer").addEventListener("click", () => navigate("developer"));
+    $("traffic-start").addEventListener("click", async () => {
+      await apiReady;
+      const count = Number.parseInt($("traffic-count").value, 10);
+      try {
+        const result = await window.pywebview.api.start_traffic(count, $("traffic-target").value || null);
+        if (!result.ok) showStatus(result.message, true);
+      } catch (error) { showStatus(`Could not start traffic: ${error.message || error}`, true); }
+    });
+    $("traffic-stop").addEventListener("click", async () => {
+      await apiReady;
+      try {
+        const result = await window.pywebview.api.stop_traffic();
+        if (!result.ok) showStatus(result.message, true);
+      } catch (error) { showStatus(`Could not stop traffic: ${error.message || error}`, true); }
+    });
+    $("congestion-slider").addEventListener("input", event => {
+      $("congestion-value").textContent = congestionLabel(Number.parseInt(event.target.value, 10), state.congestionLinkBps);
+    });
+    $("congestion-slider").addEventListener("change", async event => {
+      await apiReady;
+      try {
+        const result = await window.pywebview.api.set_congestion(Number.parseInt(event.target.value, 10));
+        if (!result.ok) showStatus(result.message, true);
+      } catch (error) { showStatus(`Could not set congestion: ${error.message || error}`, true); }
     });
     $("close-video").addEventListener("click", async () => {
       stopVideoPlayer();
@@ -780,7 +917,8 @@ CLIENT_HTML = """<!doctype html>
             if (!alive()) return;
           }
           const index = videoRun.index;
-          const response = await fetch(`/video/segment/${index}`, { cache: "no-store", signal: controller.signal });
+          const ahead = secondsBufferedAhead(sourceBuffer, player.currentTime).toFixed(2);
+          const response = await fetch(`/video/segment/${index}?buffer=${ahead}`, { cache: "no-store", signal: controller.signal });
           if (!response.ok) throw new Error(await response.text());
           const level = response.headers.get("X-Video-Level");
           const bytes = await response.arrayBuffer();
@@ -979,6 +1117,58 @@ CLIENT_HTML = """<!doctype html>
         showStatus(`Could not load saved connection: ${error.message || error}`, true);
       }
     });
+    const graph = { seconds: 60, points: [] };
+    const graphSize = { width: 640, height: 170, left: 62, right: 12, top: 10, bottom: 24 };
+    function niceCeiling(value) {
+      if (value <= 0) return 1;
+      const scale = 10 ** Math.floor(Math.log10(value));
+      const fraction = value / scale;
+      return (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10) * scale;
+    }
+    function formatWindow(seconds) {
+      return seconds >= 3600 ? "1 hr" : seconds >= 60 ? `${seconds / 60} min` : `${seconds} s`;
+    }
+    function renderDownloadChart() {
+      const { width, height, left, right, top, bottom } = graphSize;
+      const plotWidth = width - left - right;
+      const plotHeight = height - top - bottom;
+      const points = graph.points;
+      const peak = points.reduce((max, [, mbps]) => Math.max(max, mbps), 0);
+      const yMax = niceCeiling(peak * 1.1);
+      const x = ago => left + plotWidth * (1 - ago / graph.seconds);
+      const y = mbps => top + plotHeight * (1 - mbps / yMax);
+      const grid = [0, 0.5, 1].map(fraction => {
+        const value = yMax * fraction;
+        const gridY = y(value).toFixed(1);
+        return `<line class="chart-grid" x1="${left}" x2="${width - right}" y1="${gridY}" y2="${gridY}"/><text class="chart-label" x="${left - 6}" y="${gridY}" text-anchor="end" dominant-baseline="middle">${value.toFixed(value < 10 ? 1 : 0)} Mb/s</text>`;
+      }).join("");
+      const line = points.map(([ago, mbps]) => `${x(ago).toFixed(1)},${y(mbps).toFixed(1)}`).join(" ");
+      $("download-chart").innerHTML = `${grid}<polyline class="chart-line" points="${line}"/>` +
+        `<text class="chart-label" x="${left}" y="${height - 6}">${formatWindow(graph.seconds)} ago</text>` +
+        `<text class="chart-label" x="${width - right}" y="${height - 6}" text-anchor="end">now</text>`;
+      const latest = points.length ? points[points.length - 1][1].toFixed(2) : "—";
+      $("graph-now").textContent = `Now: ${latest} Mb/s`;
+      $("graph-peak").textContent = points.length ? `Peak: ${peak.toFixed(2)} Mb/s` : "Peak: —";
+    }
+    function refreshDownloadChart() {
+      if (state.view !== "videos") return;
+      apiReady
+        .then(() => window.pywebview.api.get_download_history(graph.seconds))
+        .then(result => {
+          if (!result.ok) return;
+          graph.points = result.points;
+          renderDownloadChart();
+        })
+        .catch(() => {});
+    }
+    document.querySelectorAll("#graph-windows button").forEach(button => {
+      button.addEventListener("click", () => {
+        graph.seconds = Number(button.dataset.seconds);
+        document.querySelectorAll("#graph-windows button").forEach(item => item.classList.toggle("active", item === button));
+        refreshDownloadChart();
+      });
+    });
+    setInterval(refreshDownloadChart, 1000);
     setInterval(refreshState, 500);
   </script>
 </body>

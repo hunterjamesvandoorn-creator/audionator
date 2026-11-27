@@ -13,12 +13,14 @@ LEVELS = [
 
 
 class QualityPolicyTests(unittest.TestCase):
-    def test_starts_at_middle_level(self):
-        self.assertEqual(QualityPolicy(LEVELS).level_id, "480p")
+    def test_starts_at_top_level(self):
+        self.assertEqual(QualityPolicy(LEVELS).level_id, "720p")
 
     def test_steps_down_when_throughput_is_below_bitrate(self):
         policy = QualityPolicy(LEVELS)
         # 500 kbit/s delivered for one 6 s segment.
+        policy.record(received_bytes=375_000, seconds=6.0, loss_ratio=0.0)
+        self.assertEqual(policy.level_id, "480p")
         policy.record(received_bytes=375_000, seconds=6.0, loss_ratio=0.0)
         self.assertEqual(policy.level_id, "360p")
         policy.record(received_bytes=375_000, seconds=6.0, loss_ratio=0.0)
@@ -27,10 +29,31 @@ class QualityPolicyTests(unittest.TestCase):
     def test_steps_down_on_packet_loss(self):
         policy = QualityPolicy(LEVELS)
         policy.record(received_bytes=10_000_000, seconds=1.0, loss_ratio=0.10)
+        self.assertEqual(policy.level_id, "480p")
+        policy.record(received_bytes=10_000_000, seconds=1.0, loss_ratio=0.10)
         self.assertEqual(policy.level_id, "360p")
+
+    def test_low_buffer_drops_straight_to_a_level_that_fits(self):
+        policy = QualityPolicy(LEVELS)
+        # 1 Mbit/s: 360p fits within 80% of it, 480p does not.
+        policy.record(received_bytes=750_000, seconds=6.0, loss_ratio=0.0, buffered_seconds=2.0)
+        self.assertEqual(policy.level_id, "360p")
+
+    def test_healthy_buffer_still_steps_down_one_level(self):
+        policy = QualityPolicy(LEVELS)
+        policy.record(received_bytes=750_000, seconds=6.0, loss_ratio=0.0, buffered_seconds=15.0)
+        self.assertEqual(policy.level_id, "480p")
+
+    def test_low_buffer_with_loss_steps_down_one_level(self):
+        policy = QualityPolicy(LEVELS)
+        # Throughput alone fits 720p, so only the loss drops the level, by one step.
+        policy.record(received_bytes=10_000_000, seconds=1.0, loss_ratio=0.10, buffered_seconds=2.0)
+        self.assertEqual(policy.level_id, "480p")
 
     def test_steps_up_after_a_streak_of_good_segments(self):
         policy = QualityPolicy(LEVELS)
+        policy.record(received_bytes=10_000_000, seconds=1.0, loss_ratio=0.10)
+        self.assertEqual(policy.level_id, "480p")
         for _ in range(2):
             policy.record(received_bytes=10_000_000, seconds=1.0, loss_ratio=0.0)
             self.assertEqual(policy.level_id, "480p")
@@ -134,7 +157,7 @@ class AdaptiveVideoSessionTests(unittest.TestCase):
         info = session.describe()
         self.assertEqual(info["status"], "ready")
         self.assertEqual(info["segment_count"], 3)
-        self.assertEqual(info["level"], "480p")
+        self.assertEqual(info["level"], "720p")
         self.assertEqual(info["mode"], AUTO)
         self.assertEqual(len(info["levels"]), 3)
 
@@ -152,9 +175,9 @@ class AdaptiveVideoSessionTests(unittest.TestCase):
         session.start()
         wait_until_ready(session)
         level, data = session.fetch_segment(1)
-        self.assertEqual(level, "480p")
+        self.assertEqual(level, "720p")
         self.assertEqual(len(data), 1000)
-        self.assertEqual(receiver.requests[0][:3], ("clip.mp4", "480p", 1))
+        self.assertEqual(receiver.requests[0][:3], ("clip.mp4", "720p", 1))
         self.assertEqual(receiver.released, [receiver.requests[0][3]])
         session.close()
 
@@ -199,6 +222,44 @@ class AdaptiveVideoSessionTests(unittest.TestCase):
         self.assertEqual(bps, round(1000 * 8 / TRAFFIC_WINDOW_SECONDS))
         session.close()
         self.assertTrue(receiver.closed)
+
+
+class CongestionTests(unittest.TestCase):
+    def _ready_session(self):
+        session = AdaptiveVideoSession(FakeReceiver(manifest=MANIFEST), "clip.mp4")
+        session.start()
+        wait_until_ready(session)
+        return session
+
+    def test_rejects_invalid_congestion(self):
+        session = self._ready_session()
+        for value in (-5, 96, "50", True, 12.5):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    session.set_congestion(value)
+        session.set_congestion(95)
+        session.close()
+
+    def test_congestion_holds_segments_to_the_link_share(self):
+        session = self._ready_session()
+        session.set_congestion(95)
+        # 1000 bytes at 5% of 10 Mbit/s needs 16 ms.
+        started = time.monotonic()
+        session.fetch_segment(0)
+        self.assertGreaterEqual(time.monotonic() - started, 0.01)
+        session.close()
+
+    def test_heavy_congestion_steps_auto_quality_down(self):
+        session = self._ready_session()
+        self.assertEqual(session.describe()["level"], "720p")
+        session.set_congestion(95)
+        level, _ = session.fetch_segment(0)
+        self.assertEqual(level, "720p")
+        level, _ = session.fetch_segment(1)
+        self.assertEqual(level, "480p")
+        level, _ = session.fetch_segment(2)
+        self.assertEqual(level, "360p")
+        session.close()
 
 
 if __name__ == "__main__":

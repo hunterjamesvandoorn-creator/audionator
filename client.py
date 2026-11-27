@@ -5,7 +5,9 @@ import json
 import math
 import os
 import queue
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -20,8 +22,10 @@ from mutagen import MutagenError
 from mutagen.mp3 import MP3
 
 from audio_stream import StreamingAudioFile
+from download_meter import RETAIN_SECONDS, DownloadMeter
 from receiver import AudioReceiver
-from video_session import AdaptiveVideoSession
+from traffic_simulator import TrafficSimulator
+from video_session import SIMULATED_LINK_BPS, AdaptiveVideoSession, validate_congestion
 from video_stream import VideoHTTPServer
 
 RESUME_END_MARGIN_SECONDS = 5.0
@@ -42,13 +46,17 @@ class AudionatorAPI:
         settings_path: Path | None = None,
     ) -> None:
         self.download_directory = download_directory
-        self.receiver = AudioReceiver(download_directory)
+        self.download_meter = DownloadMeter()
+        self.receiver = AudioReceiver(download_directory, self.download_meter)
         self.video_server = video_server
         local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         self.settings_path = settings_path or local_app_data / "Audionator" / "settings.json"
         self.saved_host = ""
         self.saved_port = 5005
         self.playback_positions: dict[str, float] = {}
+        self.developer_mode = False
+        self.traffic: TrafficSimulator | None = None
+        self.congestion_percent = 0
         try:
             if self.settings_path.exists():
                 settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -68,6 +76,10 @@ class AudionatorAPI:
                     for name, seconds in positions.items()
                     if type(seconds) in (int, float) and math.isfinite(seconds) and seconds > 0
                 }
+                developer_mode = settings.get("developer_mode", False)
+                if type(developer_mode) is not bool:
+                    raise ValueError("Saved developer mode setting must be true or false.")
+                self.developer_mode = developer_mode
         except (OSError, ValueError) as error:
             self._set_message(f"Could not load saved connection settings: {error}", is_error=True)
         self.video_session: AdaptiveVideoSession | None = None
@@ -115,7 +127,7 @@ class AudionatorAPI:
                 self.close_video()
                 if self.receiver.is_running:
                     self.receiver.close()
-                self.receiver = AudioReceiver(self.download_directory)
+                self.receiver = AudioReceiver(self.download_directory, self.download_meter)
                 self.receiver.connect(host, port)
                 self.connected_server = server
                 self.session_code = None
@@ -185,7 +197,7 @@ class AudionatorAPI:
             self.is_paused = True
             self._remember_position()
         self.close_video()
-        receiver = AudioReceiver(self.download_directory)
+        receiver = AudioReceiver(self.download_directory, self.download_meter)
         try:
             receiver.connect(*self.connected_server)
         except (OSError, RuntimeError, ValueError) as error:
@@ -193,6 +205,7 @@ class AudionatorAPI:
             self._set_message(f"Could not open the video stream: {error}", is_error=True)
             return {"ok": False, "message": str(error)}
         session = AdaptiveVideoSession(receiver, name)
+        session.set_congestion(self.congestion_percent)
         session.start()
         self.video_session = session
         self.video_server.set_video_session(session)
@@ -289,7 +302,13 @@ class AudionatorAPI:
             "packets": packets,
         }
 
+    def get_download_history(self, window_seconds: Any) -> dict[str, Any]:
+        if type(window_seconds) not in (int, float) or not 1 <= window_seconds <= RETAIN_SECONDS:
+            return self._failure("Choose a window between 1 second and 1 hour.")
+        return {"ok": True, "points": self.download_meter.history(window_seconds)}
+
     def get_state(self) -> dict[str, Any]:
+        self.download_meter.sample()
         self._process_receiver_events(self.receiver, is_video=False)
         if self.video_session:
             self._process_receiver_events(self.video_session.receiver, is_video=True)
@@ -340,9 +359,71 @@ class AudionatorAPI:
                 "session": self.video_session.describe() if self.video_session else None,
             },
             "session": {"code": self.session_code if self.connected else None, "members": self.session_members},
+            "developer_mode": self.developer_mode,
+            "traffic": self.traffic.status() if self.traffic else None,
+            "congestion": {"percent": self.congestion_percent, "link_bps": SIMULATED_LINK_BPS},
         }
 
+    def set_developer_mode(self, enabled: bool) -> dict[str, Any]:
+        self.developer_mode = bool(enabled)
+        if not self.developer_mode:
+            self._stop_traffic()
+            self._set_congestion_percent(0)
+        error = self._save_settings()
+        if error:
+            return self._failure(error)
+        self._set_message("Developer mode is on." if self.developer_mode else "Developer mode is off.")
+        return {"ok": True}
+
+    def start_traffic(self, client_count: Any, file_name: str | None) -> dict[str, Any]:
+        if not self.developer_mode:
+            return self._failure("Turn on developer mode in Settings first.")
+        if not self.connected or self.connected_server is None:
+            return self._failure("Connect to a server before starting simulated traffic.")
+        if type(client_count) is not int:
+            return self._failure("Enter a whole number of simulated clients.")
+        if file_name and file_name not in {item["name"] for item in self.media_by_type["audio"]}:
+            return self._failure("Choose a track from the shared library.")
+        self._stop_traffic()
+        host, port = self.connected_server
+        work_directory = Path(tempfile.mkdtemp(prefix="audionator-traffic-"))
+        try:
+            simulator = TrafficSimulator(host, port, client_count, work_directory, file_name or None)
+        except ValueError as error:
+            shutil.rmtree(work_directory, ignore_errors=True)
+            return self._failure(str(error))
+        simulator.start()
+        self.traffic = simulator
+        self._set_message(f"Started {client_count} simulated client{'s' if client_count != 1 else ''}.")
+        return {"ok": True}
+
+    def stop_traffic(self) -> dict[str, Any]:
+        self._stop_traffic()
+        self._set_message("Stopped simulated traffic.")
+        return {"ok": True}
+
+    def _stop_traffic(self) -> None:
+        if self.traffic:
+            self.traffic.stop()
+            self.traffic = None
+
+    def set_congestion(self, percent: Any) -> dict[str, Any]:
+        if not self.developer_mode:
+            return self._failure("Turn on developer mode in Settings first.")
+        try:
+            value = validate_congestion(percent)
+        except ValueError as error:
+            return self._failure(str(error))
+        self._set_congestion_percent(value)
+        return {"ok": True}
+
+    def _set_congestion_percent(self, percent: int) -> None:
+        self.congestion_percent = percent
+        if self.video_session:
+            self.video_session.set_congestion(percent)
+
     def shutdown(self) -> None:
+        self._stop_traffic()
         self._remember_position()
         self.close_video()
         self.receiver.close()
@@ -573,6 +654,7 @@ class AudionatorAPI:
                         "host": self.saved_host,
                         "port": self.saved_port,
                         "playback_positions": self.playback_positions,
+                        "developer_mode": self.developer_mode,
                     }
                 ),
                 encoding="utf-8",

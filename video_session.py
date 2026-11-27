@@ -16,8 +16,12 @@ LOSS_LIMIT = 0.05
 SMOOTHING = 0.5
 UPGRADE_STREAK = 3
 UPGRADE_HEADROOM = 1.25
-START_LEVEL_INDEX = 1
+START_LEVEL_INDEX = 0
 TRAFFIC_WINDOW_SECONDS = 3.0
+BUFFER_LOW_SECONDS = 8.0
+FIT_FRACTION = 0.8
+SIMULATED_LINK_BPS = 10_000_000
+MAX_CONGESTION_PERCENT = 95
 SUMMARY_KEYS = (
     "codecs",
     "segment_seconds",
@@ -26,6 +30,12 @@ SUMMARY_KEYS = (
     "duration",
     "levels",
 )
+
+
+def validate_congestion(percent: Any) -> int:
+    if type(percent) is not int or not 0 <= percent <= MAX_CONGESTION_PERCENT:
+        raise ValueError(f"Congestion must be a whole number from 0 to {MAX_CONGESTION_PERCENT}.")
+    return percent
 
 
 class QualityPolicy:
@@ -56,7 +66,21 @@ class QualityPolicy:
                 return
         raise ValueError("Unknown video quality.")
 
-    def record(self, received_bytes: int, seconds: float, loss_ratio: float) -> None:
+    def _fit_index(self) -> int:
+        """Best level whose bitrate fits the measured throughput, or the lowest level if none does."""
+        budget = (self.throughput or 0) * FIT_FRACTION
+        for index, level in enumerate(self.levels):
+            if level["bandwidth"] <= budget:
+                return index
+        return len(self.levels) - 1
+
+    def record(
+        self,
+        received_bytes: int,
+        seconds: float,
+        loss_ratio: float,
+        buffered_seconds: float | None = None,
+    ) -> None:
         """Feed one finished media segment into the policy. Only auto mode changes the level."""
         sample = received_bytes * 8 / max(seconds, 1e-3)
         if self.throughput is None:
@@ -71,8 +95,10 @@ class QualityPolicy:
         )
         if struggling:
             self._good_streak = 0
-            if self.current < len(self.levels) - 1:
-                self.current += 1
+            step = self.current + 1
+            if buffered_seconds is not None and buffered_seconds < BUFFER_LOW_SECONDS:
+                step = max(step, self._fit_index())
+            self.current = min(step, len(self.levels) - 1)
             return
 
         self._good_streak += 1
@@ -95,6 +121,7 @@ class AdaptiveVideoSession:
         self._summary: dict[str, Any] | None = None
         self._policy: QualityPolicy | None = None
         self._traffic: deque[tuple[float, int]] = deque()
+        self._congestion_percent = 0
         self._closed = False
 
     def start(self) -> None:
@@ -131,7 +158,7 @@ class AdaptiveVideoSession:
             raise RuntimeError(self._message or "The video is still being prepared.")
         return self._summary, self._policy
 
-    def fetch_segment(self, index: int) -> tuple[str, bytes]:
+    def fetch_segment(self, index: int, buffered_seconds: float | None = None) -> tuple[str, bytes]:
         """Download media segment `index` at the policy's current level. Returns (level_id, bytes)."""
         with self._lock:
             summary, policy = self._ready_locked()
@@ -142,7 +169,7 @@ class AdaptiveVideoSession:
         before_missed, before_packets = self.receiver.loss_counts()
         started = time.monotonic()
         data = self._fetch(level_id, index)
-        seconds = time.monotonic() - started
+        seconds = self._pace(len(data), time.monotonic() - started)
         after_missed, after_packets = self.receiver.loss_counts()
 
         packets = after_packets - before_packets
@@ -150,8 +177,27 @@ class AdaptiveVideoSession:
         loss_ratio = missed / packets if packets > 0 else 0.0
         with self._lock:
             if self._policy is not None:
-                self._policy.record(len(data), seconds, loss_ratio)
+                self._policy.record(len(data), seconds, loss_ratio, buffered_seconds)
         return level_id, data
+
+    def _pace(self, byte_count: int, elapsed: float) -> float:
+        """Hold a segment back so it arrives no faster than the simulated link share allows."""
+        with self._lock:
+            percent = self._congestion_percent
+        if percent == 0:
+            return elapsed
+        share_bps = SIMULATED_LINK_BPS * (100 - percent) / 100
+        required = byte_count * 8 / share_bps
+        if required > elapsed:
+            time.sleep(required - elapsed)
+            return required
+        return elapsed
+
+    def set_congestion(self, percent: int) -> None:
+        """Limit video to a share of the simulated link. Developer tool only; sends no extra traffic."""
+        value = validate_congestion(percent)
+        with self._lock:
+            self._congestion_percent = value
 
     def fetch_init(self, level_id: str) -> bytes:
         """Download the initialization segment for one level."""

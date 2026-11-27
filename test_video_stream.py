@@ -31,6 +31,7 @@ class FakeSession:
     def __init__(self, status: str = "ready", segment_error: Exception | None = None) -> None:
         self.status = status
         self.segment_error = segment_error
+        self.buffered_seen: list[float | None] = []
 
     def describe(self) -> dict:
         info = {"name": "clip.mp4", "status": self.status, "message": "", "traffic_bps": 0}
@@ -49,7 +50,8 @@ class FakeSession:
             )
         return info
 
-    def fetch_segment(self, index: int) -> tuple[str, bytes]:
+    def fetch_segment(self, index: int, buffered_seconds: float | None = None) -> tuple[str, bytes]:
+        self.buffered_seen.append(buffered_seconds)
         if self.segment_error is not None:
             raise self.segment_error
         if not 0 <= index < 2:
@@ -118,6 +120,20 @@ class AdaptiveRouteTests(unittest.TestCase):
         self.server.set_video_session(FakeSession())
         self.assertEqual(self.get("/video/segment/9")[0], 404)
         self.assertEqual(self.get("/video/segment/abc")[0], 404)
+
+    def test_segment_request_passes_buffered_seconds_to_session(self) -> None:
+        session = FakeSession()
+        self.server.set_video_session(session)
+        self.get("/video/segment/1?buffer=4.5")
+        self.get("/video/segment/0")
+        self.assertEqual(session.buffered_seen, [4.5, None])
+
+    def test_invalid_buffer_value_is_treated_as_unknown(self) -> None:
+        session = FakeSession()
+        self.server.set_video_session(session)
+        self.get("/video/segment/0?buffer=abc")
+        self.get("/video/segment/0?buffer=-1")
+        self.assertEqual(session.buffered_seen, [None, None])
 
     def test_init_segment_is_served_and_unknown_level_is_not_found(self) -> None:
         self.server.set_video_session(FakeSession())

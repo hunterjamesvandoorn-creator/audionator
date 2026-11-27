@@ -6,7 +6,7 @@ import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from client_ui import CLIENT_HTML
 from video_session import AdaptiveVideoSession
@@ -14,6 +14,19 @@ from video_session import AdaptiveVideoSession
 
 MEDIA_PREFIX_INIT = "/video/init/"
 MEDIA_PREFIX_SEGMENT = "/video/segment/"
+MAX_BUFFERED_SECONDS = 3600.0
+
+
+def _buffered_seconds(query: str) -> float | None:
+    """Read the player's buffered-ahead seconds from ?buffer=. Missing or invalid values mean unknown."""
+    values = parse_qs(query).get("buffer")
+    if not values:
+        return None
+    try:
+        seconds = float(values[0])
+    except ValueError:
+        return None
+    return seconds if 0 <= seconds <= MAX_BUFFERED_SECONDS else None
 
 
 class VideoHTTPServer(ThreadingHTTPServer):
@@ -42,7 +55,8 @@ class VideoRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
-        path = urlsplit(self.path).path
+        parts = urlsplit(self.path)
+        path = parts.path
         if path in {"/", "/player"}:
             self._send_bytes(200, CLIENT_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif path == "/video/manifest":
@@ -55,14 +69,14 @@ class VideoRequestHandler(BaseHTTPRequestHandler):
             if not re.fullmatch(r"\d{1,6}", index_text):
                 self._send_text(404, "That video segment does not exist.")
                 return
-            self._with_session(self._segment_action(int(index_text)))
+            self._with_session(self._segment_action(int(index_text), _buffered_seconds(parts.query)))
         else:
             self._send_text(404, "Not found")
 
     @staticmethod
-    def _segment_action(index: int) -> Callable[[AdaptiveVideoSession], tuple[dict[str, str], bytes]]:
+    def _segment_action(index: int, buffered_seconds: float | None) -> Callable[[AdaptiveVideoSession], tuple[dict[str, str], bytes]]:
         def action(session: AdaptiveVideoSession) -> tuple[dict[str, str], bytes]:
-            level, data = session.fetch_segment(index)
+            level, data = session.fetch_segment(index, buffered_seconds)
             return {"X-Video-Level": level}, data
 
         return action

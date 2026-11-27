@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from download_meter import DownloadMeter
 from udp_protocol import (
     ACK,
     CONTROL,
@@ -64,8 +65,9 @@ class _Request:
 
 
 class AudioReceiver:
-    def __init__(self, download_directory: Path | None = None) -> None:
+    def __init__(self, download_directory: Path | None = None, meter: DownloadMeter | None = None) -> None:
         self.download_directory = download_directory or Path(__file__).resolve().parent / "received"
+        self._meter = meter
         self.events: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self._stop = threading.Event()
         self._socket: socket.socket | None = None
@@ -402,6 +404,8 @@ class AudioReceiver:
                 self._retransmit_controls()
                 self._service_heartbeat()
                 packet, address = sock.recvfrom(2048)
+                if self._meter:
+                    self._meter.add(len(packet))
                 self._handle_packet(packet, address)
             except socket.timeout:
                 continue
